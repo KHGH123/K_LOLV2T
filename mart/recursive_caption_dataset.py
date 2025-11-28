@@ -20,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pickle
 from typing import List, Optional, Tuple
 
 import h5py
@@ -118,9 +119,9 @@ class RecursiveCaptionDataset(data.Dataset):
                 raise ValueError(f"Mode must be [train, val, test] for {self.dset_name}, got {mode}")
         elif self.dset_name == "youcook2":
             if mode == "train":  # 1333 videos
-                data_path = self.annotations_dir / self.dset_name / "captioning_train.json"
+                data_path = self.annotations_dir / self.dset_name / "training.json"
             elif mode == "val":  # 457 videos
-                data_path = self.annotations_dir / self.dset_name / "captioning_val.json"
+                data_path = self.annotations_dir / self.dset_name / "validation.json"
             else:
                 raise ValueError(f"Mode must be [train, val] for {self.dset_name}, got {mode}")
         else:
@@ -213,14 +214,16 @@ class RecursiveCaptionDataset(data.Dataset):
             with open(self.duration_file, "r") as f:
                 for line in f:
                     vid_name, vid_dur, vid_frame = [entry.strip() for entry in line.split(",")]
-                    if self.dset_name == "activitynet":
-                        frame_to_second[vid_name] = float(vid_dur) * int(float(vid_frame) * 1. / int(
+                    frame_to_second[vid_name] = float(vid_dur) * int(float(vid_frame) * 1. / int(
                             float(vid_dur)) * sampling_sec) * 1. / float(vid_frame)
-                    elif self.dset_name == "youcook2":
-                        frame_to_second[vid_name] = float(vid_dur) * math.ceil(float(vid_frame) * 1. / float(
-                            vid_dur) * sampling_sec) * 1. / float(vid_frame)  # for yc2
-                    else:
-                        raise NotImplementedError(f"Only support activitynet and youcook2, got {self.dset_name}")
+                    # if self.dset_name == "activitynet":
+                    #     frame_to_second[vid_name] = float(vid_dur) * int(float(vid_frame) * 1. / int(
+                    #         float(vid_dur)) * sampling_sec) * 1. / float(vid_frame)
+                    # elif self.dset_name == "youcook2":
+                    #     frame_to_second[vid_name] = float(vid_dur) * math.ceil(float(vid_frame) * 1. / float(
+                    #         vid_dur) * sampling_sec) * 1. / float(vid_frame)  # for yc2
+                    # else:
+                    #     raise NotImplementedError(f"Only support activitynet and youcook2, got {self.dset_name}")
 
             if self.dset_name == "activitynet":
                 frame_to_second["_0CqozZun3U"] = sampling_sec  # a missing video in anet
@@ -229,9 +232,13 @@ class RecursiveCaptionDataset(data.Dataset):
             self.missing_video_names = []
             for e in tqdm(self.data):
                 video_name = e["name"][2:] if self.dset_name == "activitynet" else e["name"]
-                cur_path_resnet = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
-                cur_path_bn = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
-                for p in [cur_path_bn, cur_path_resnet]:
+                if self.dset_name == "activitynet":
+                    cur_path1 = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
+                    cur_path2 = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
+                elif self.dset_name == "youcook2":
+                    cur_path1 = os.path.join(self.video_feature_dir, "{}_rgb.pkl".format(video_name))
+                    cur_path2 = os.path.join(self.video_feature_dir, "{}_flow.pkl".format(video_name))
+                for p in [cur_path1, cur_path2]:
                     if not os.path.exists(p):
                         self.missing_video_names.append(video_name)
             print(f"Missing {len(self.missing_video_names)} features (clips/sentences) "
@@ -288,9 +295,22 @@ class RecursiveCaptionDataset(data.Dataset):
         if self.preload and self.preloading_done:
             return self.preloaded_videos[raw_name]
         video_name = raw_name[2:] if self.dset_name == "activitynet" else raw_name
-        feat_path_resnet = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
-        feat_path_bn = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
-        video_feature = np.concatenate([np.load(feat_path_resnet), np.load(feat_path_bn)], axis=1)
+        if self.dset_name == "activitynet":
+            feat_path_resnet = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
+            feat_path_bn = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
+            video_feature = np.concatenate([np.load(feat_path_resnet), np.load(feat_path_bn)], axis=1)
+
+        elif self.dset_name == "youcook2":
+            rgb_path = os.path.join(self.video_feature_dir, f"{video_name}_rgb.pkl")
+            flow_path = os.path.join(self.video_feature_dir, f"{video_name}_flow.pkl")
+
+            with open(rgb_path, "rb") as f:
+                rgb_feat = pickle.load(f)
+
+            with open(flow_path, "rb") as f:
+                flow_feat = pickle.load(f)
+
+            video_feature = np.concatenate([rgb_feat, flow_feat], axis=-1)
         return video_feature
 
     def _load_coot_video_feature(self, raw_name: str) -> Tuple[np.array, np.array, List[np.array]]:
@@ -555,7 +575,7 @@ class RecursiveCaptionDataset(data.Dataset):
 
         feat = np.zeros((self.max_v_len + self.max_t_len, raw_feat.shape[1]))  # includes [CLS], [SEP]
         if indexed_feat_len > max_v_l:
-            downsamlp_indices = np.linspace(st, ed, max_v_l, endpoint=True).astype(np.int).tolist()
+            downsamlp_indices = np.linspace(st, ed, max_v_l, endpoint=True).astype(int).tolist()
             assert max(downsamlp_indices) < feat_len
             feat[1:max_v_l + 1] = raw_feat[downsamlp_indices]  # truncate, sample???
 
@@ -593,7 +613,7 @@ class RecursiveCaptionDataset(data.Dataset):
         indexed_feat_len = ed - st + 1
 
         if indexed_feat_len > max_v_l:
-            downsamlp_indices = np.linspace(st, ed, max_v_l, endpoint=True).astype(np.int).tolist()
+            downsamlp_indices = np.linspace(st, ed, max_v_l, endpoint=True).astype(int).tolist()
             assert max(downsamlp_indices) < feat_len
             feat = raw_feat[downsamlp_indices]  # truncate, sample???
             mask = [1] * max_v_l  # no padding

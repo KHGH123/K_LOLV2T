@@ -2,21 +2,21 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-    batch_size: 16
-    num_epochs: 50
-    loss_func: "crossentropy"
-    clip_gradient: 1
+  batch_size: 16
+  num_epochs: 50
+  loss_func: "crossentropy"
+  clip_gradient: 1
 label_smoothing: 0.1
 # ---------- Validation ----------
 val:
-    batch_size: 50
-    val_freq: 1
-    val_start: 0
-    det_best_field: "cider"
-    det_best_compare_mode: "max"
-    det_best_threshold_mode: "rel"
-    det_best_threshold_value: 1e-4
-    det_best_terminate_after: 10
+  batch_size: 50
+  val_freq: 1
+  val_start: 0
+  det_best_field: "cider"
+  det_best_compare_mode: "max"
+  det_best_threshold_mode: "rel"
+  det_best_threshold_value: 1e-4
+  det_best_terminate_after: 10
 save_mode: "best"
 # beam search
 use_beam: false
@@ -30,20 +30,20 @@ length_penalty_name: "none"
 length_penalty_alpha: 0.
 # ---------- Dataset / Dataloader ----------
 dataset_train:
-    name: "youcook2"
-    data_type: "auto"
-    subset: "default"
-    split: "train"
-    max_datapoints: -1
-    shuffle: true
-    pin_memory: true
-    num_workers: 4
-    drop_last: false
-    preload: false
+  name: "youcook2"
+  data_type: "auto"
+  subset: "default"
+  split: "train"
+  max_datapoints: -1
+  shuffle: true
+  pin_memory: true
+  num_workers: 4
+  drop_last: false
+  preload: false
 dataset_val:
-    same_as: "dataset_train"
-    shuffle: false
-    split: "val"
+  same_as: "dataset_train"
+  shuffle: false
+  split: "val"
 max_n_sen: 12 # 6 activitynet, 12 youcook2
 max_n_sen_add_val: 10
 max_t_len: 22
@@ -56,7 +56,7 @@ coot_dim_clip: 384
 coot_dim_vid: 768
 coot_mode: "clip"
 # Video feature size: 3072 for rgb+flow features, 1152 for COOT vidclip, 384 for COOT clip
-video_feature_size: 3072
+video_feature_size: 4096
 # ---------- Technical ----------
 random_seed: null
 use_cuda: true
@@ -93,13 +93,13 @@ lr: 0.0001
 lr_warmup_proportion: 0.1
 # ---------- Logging ----------
 logging:
-    step_train: 10
-    step_val: 10
-    step_gpu: -1
-    step_gpu_once: 10
+  step_train: 10
+  step_val: 10
+  step_gpu: -1
+  step_gpu_once: 10
 # ---------- Saving ----------
 saving:
-    keep_freq: -1
-    save_last: true
-    save_best: true
-    save_opt_state: true
+  keep_freq: -1
+  save_last: true
+  save_best: true
+  save_opt_state: true
