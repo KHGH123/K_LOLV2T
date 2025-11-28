@@ -34,8 +34,7 @@ dataset_train:
   data_type: "auto"
   subset: "default"
   split: "train"
-  # max_datapoints: -1
-  max_datapoints: 300
+  max_datapoints: -1
   shuffle: true
   pin_memory: true
   num_workers: 0
