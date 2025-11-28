@@ -100,7 +100,7 @@ logging:
   step_gpu_once: 10
 # ---------- Saving ----------
 saving:
-  keep_freq: -1
+  keep_freq: 1
   save_last: true
   save_best: true
   save_opt_state: true

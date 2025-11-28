@@ -5,6 +5,7 @@ Trainer for retrieval training and validation. Holds the main training loop.
 import json
 import logging
 import os
+import sys
 from collections import defaultdict
 from collections.abc import Mapping
 from glob import glob
@@ -36,6 +37,9 @@ from nntrainer.models import BaseModelManager
 from nntrainer.trainer_configs import BaseTrainerState
 from nntrainer.utils import TrainerPathConst
 
+current_path = os.path.dirname(os.path.abspath(__file__))
+if current_path not in sys.path:
+    sys.path.append(current_path)
 
 def cal_performance(pred, gold):
     pred = pred.max(2)[1].contiguous().view(-1)
