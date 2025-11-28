@@ -2,7 +2,7 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-  batch_size: 16
+  batch_size: 64
   num_epochs: 50
   loss_func: "crossentropy"
   clip_gradient: 1
