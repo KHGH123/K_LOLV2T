@@ -13,7 +13,7 @@ class MartPathConst(ConstantHolder):
     CACHE_DIR = "cache_caption"
     COOT_FEAT_DIR = "provided_embeddings"
     ANNOTATIONS_DIR = "annotations"
-    VIDEO_FEATURE_DIR = "/../../../data"
+    VIDEO_FEATURE_DIR = "/data/mart_video_feature"
 
 
 # ---------- MART config ----------
