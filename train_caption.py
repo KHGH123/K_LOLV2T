@@ -31,6 +31,7 @@ def main():
     arguments_mart.add_mart_args(parser)  # some more paths for mart
     parser.add_argument("--load_model", type=str, default=None, help="Load model from file.")
     parser.add_argument("--print_model", action="store_true", help=f"Print model")
+    parser.add_argument("--type", type=int, default=1)
     args = parser.parse_args()
 
     # load repository config yaml file to dict
@@ -43,6 +44,9 @@ def main():
 
     # read experiment config dict
     cfg = Config(config)
+    if hasattr(args, "type"):
+        cfg.type = args.type
+        print(f"[Info] Config 'type' overwritten from CLI args: {cfg.type}")
     if args.print_config:
         print(cfg)
 

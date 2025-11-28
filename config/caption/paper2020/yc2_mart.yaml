@@ -1,5 +1,6 @@
 description: ""
 config_type: "mart"
+type: 1
 # ---------- Training ----------
 train:
   batch_size: 64
