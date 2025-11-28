@@ -34,10 +34,11 @@ dataset_train:
   data_type: "auto"
   subset: "default"
   split: "train"
-  max_datapoints: -1
+  # max_datapoints: -1
+  max_datapoints: 300
   shuffle: true
   pin_memory: true
-  num_workers: 4
+  num_workers: 0
   drop_last: false
   preload: false
 dataset_val:
