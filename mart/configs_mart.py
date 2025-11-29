@@ -110,6 +110,7 @@ class MartConfig(trainer_configs.BaseExperimentConfig):
         self.dataset_val = MartDatasetConfig(config.pop("dataset_val"))
         self.logging = trainer_configs.BaseLoggingConfig(config.pop("logging"))
         self.saving = trainer_configs.BaseSavingConfig(config.pop("saving"))
+        self.type: int = config.pop("type", 1)
 
         # more training
         self.label_smoothing: float = config.pop("label_smoothing")
