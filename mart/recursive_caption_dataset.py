@@ -244,6 +244,7 @@ class RecursiveCaptionDataset(data.Dataset):
             print(f"Missing {len(self.missing_video_names)} features (clips/sentences) "
                   f"from {len(set(self.missing_video_names))} videos")
             print(f"Missing {set(self.missing_video_names)}")
+            print(self.video_feature_dir)
             if self.dset_name == "activitynet":
                 self.data = [e for e in self.data if e["name"][2:] not in self.missing_video_names]
             elif self.dset_name == "youcook2":

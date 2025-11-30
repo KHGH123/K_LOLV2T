@@ -62,7 +62,7 @@ def create_mart_model(cfg: MartConfig, vocab_size: int, cache_dir: str = MartPat
             model = TransformerXL(cfg)
         else:
             logger.info("Use recurrent model - Mine")
-            model = RecursiveTransformer(cfg)
+            model = BiDirectionalRecursiveTransformer(cfg)
     else:  # single sentence, including untied
         if cfg.untied:
             logger.info("Use untied non-recurrent single sentence model")
@@ -1425,7 +1425,8 @@ class RecursiveTransformer(nn.Module):
         return prev_ms, encoded_layer_outputs, prediction_scores
 
     def forward(self, input_ids_list, video_features_list, input_masks_list,
-                token_type_ids_list, input_labels_list, return_memory=False):
+                token_type_ids_list, input_labels_list, return_memory=False, 
+                return_hidden=False):
         """
         Args:
             input_ids_list: [(N, L)] * step_size
@@ -1444,6 +1445,7 @@ class RecursiveTransformer(nn.Module):
         step_size = len(input_ids_list)
         memory_list = []  # [(N, M, D)] * num_hidden_layers * step_size
         encoded_outputs_list = []  # [(N, L, D)] * step_size
+        last_hidden_list = []
         prediction_scores_list = []  # [(N, L, vocab_size)] * step_size
         for idx in range(step_size):
             prev_ms, encoded_layer_outputs, prediction_scores =\
@@ -1452,6 +1454,7 @@ class RecursiveTransformer(nn.Module):
 
             memory_list.append(prev_ms)
             encoded_outputs_list.append(encoded_layer_outputs)
+            last_hidden_list.append(encoded_layer_outputs[-1])
             prediction_scores_list.append(prediction_scores)
 
         if return_memory:  # used to analyze memory
@@ -1462,4 +1465,113 @@ class RecursiveTransformer(nn.Module):
             for idx in range(step_size):
                 caption_loss += self.loss_func(prediction_scores_list[idx].view(-1, self.cfg.vocab_size),
                                                input_labels_list[idx].view(-1))
-            return caption_loss, prediction_scores_list
+            if return_hidden:
+                return caption_loss, prediction_scores_list, last_hidden_list
+            else:
+                return caption_loss, prediction_scores_list
+
+class BiDirectionalRecursiveTransformer(nn.Module):
+    """
+    Bidirectional MART:
+    - forward RecursiveTransformer: 과거→현재 흐름
+    - backward RecursiveTransformer: 문단 순서를 뒤집어서 미래→현재 흐름
+    - 두 방향의 hidden state를 게이트로 섞어 최종 caption 생성
+    """
+
+    def __init__(self, cfg: MartConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        # forward / backward MART 인스턴스
+        self.fwd_model = RecursiveTransformer(cfg)
+        self.bwd_model = RecursiveTransformer(cfg)
+
+        # 파라미터 공유
+        # 동일한 encoder/decoder/embedding을 공유해서 파라미터 수를 늘리지 않을 수도 있음
+        self.bwd_model.embeddings = self.fwd_model.embeddings
+        self.bwd_model.encoder = self.fwd_model.encoder
+        self.bwd_model.decoder = self.fwd_model.decoder
+
+        # FM_t, BM_t, (FM_t - BM_t) -> Z_t (게이트, D 차원 벡터)
+        self.fusion_gate = nn.Linear(cfg.hidden_size * 3, cfg.hidden_size)
+
+        # 최종 loss (forward / backward는 auxiliary로 볼 수 있음)
+        if cfg.label_smoothing != 0:
+            self.loss_func = LabelSmoothingLoss(cfg.label_smoothing, cfg.vocab_size, ignore_index=-1)
+        else:
+            self.loss_func = nn.CrossEntropyLoss(ignore_index=-1)
+
+    def forward(self, input_ids_list, video_features_list, input_masks_list,
+                token_type_ids_list, input_labels_list):
+        """
+        Args:
+            input_ids_list: [(N, L)] * step_size
+            video_features_list: [(N, L, D_v)] * step_size
+            input_masks_list: [(N, L)] * step_size
+            token_type_ids_list: [(N, L)] * step_size
+            input_labels_list: [(N, L)] * step_size
+        Returns:
+            caption_loss: scalar
+            prediction_scores_list: [(N, L, vocab_size)] * step_size  (게이트 적용 후 최종 logits)
+        """
+
+        step_size = len(input_ids_list)
+
+        # Forward MART 
+        fwd_loss, fwd_scores_list, fwd_hidden_list = self.fwd_model(
+            input_ids_list,
+            video_features_list,
+            input_masks_list,
+            token_type_ids_list,
+            input_labels_list,
+            return_memory=False,
+            return_hidden=True
+        )
+
+        # Backward MART
+        rev_input_ids_list = list(reversed(input_ids_list))
+        rev_video_features_list = list(reversed(video_features_list))
+        rev_input_masks_list = list(reversed(input_masks_list))
+        rev_token_type_ids_list = list(reversed(token_type_ids_list))
+        rev_input_labels_list = list(reversed(input_labels_list))
+
+        bwd_loss, bwd_scores_list_rev, bwd_hidden_list_rev = self.bwd_model(
+            rev_input_ids_list,
+            rev_video_features_list,
+            rev_input_masks_list,
+            rev_token_type_ids_list,
+            rev_input_labels_list,
+            return_memory=False,
+            return_hidden=True
+        )
+
+        # backward 결과를 다시 원래 step 순서로 되돌리기
+        bwd_hidden_list = list(reversed(bwd_hidden_list_rev))
+        # (필요하다면 bwd_scores_list도 되돌릴 수 있음, 지금은 hidden만 사용)
+
+        # FM_t, BM_t를 게이트로 섞기
+        fused_scores_list = []
+        total_loss = 0.0
+
+        for idx in range(step_size):
+            # fwd_hidden, bwd_hidden: (N, L, D)
+            fwd_h = fwd_hidden_list[idx]
+            bwd_h = bwd_hidden_list[idx]
+
+            # 게이트 입력: [FM_t, BM_t, FM_t - BM_t]
+            gate_in = torch.cat([fwd_h, bwd_h, fwd_h - bwd_h], dim=-1)  # (N, L, 3D)
+            z_t = torch.sigmoid(self.fusion_gate(gate_in))             # (N, L, D)
+
+            fused_h = (1.0 - z_t) * fwd_h + z_t * bwd_h                # (N, L, D)
+
+            # 기존 MART decoder를 그대로 사용해 logits 생성
+            logits = self.fwd_model.decoder(fused_h)                   # (N, L, vocab_size)
+            fused_scores_list.append(logits)
+
+            # 이 fused logits 기준으로 최종 loss 계산
+            total_loss += self.loss_func(
+                logits.view(-1, self.cfg.vocab_size),
+                input_labels_list[idx].view(-1)
+            )
+
+        return total_loss, fused_scores_list

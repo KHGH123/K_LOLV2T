@@ -57,7 +57,7 @@ def main():
 
     # create dataset
     train_set, val_set, train_loader, val_loader = create_mart_datasets_and_loaders(
-        cfg, args.coot_feat_dir, args.annotations_dir, args.video_feature_dir)
+        cfg, args.coot_feat_dir, args.annotations_dir, "../../../data")
 
     for i, run_number in enumerate(range(args.start_run, args.start_run + args.num_runs)):
         run_name = f"{args.run_name}{run_number}"
