@@ -1413,7 +1413,7 @@ class RecursiveTransformer(nn.Module):
     def __init__(self, cfg: MartConfig):
         super().__init__()
         self.cfg = cfg
-        if cfg.type == 1: print('type 1')
+        if cfg.type == 1: print('========================type 1==========================')
         self.embeddings = BertEmbeddingsWithVideo(cfg, add_postion_embeddings=True)
         self.encoder = BertEncoderWithMemory(cfg)
         decoder_classifier_weight = self.embeddings.word_embeddings.weight\
