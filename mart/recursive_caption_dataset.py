@@ -119,9 +119,9 @@ class RecursiveCaptionDataset(data.Dataset):
                 raise ValueError(f"Mode must be [train, val, test] for {self.dset_name}, got {mode}")
         elif self.dset_name == "youcook2":
             if mode == "train":  # 1333 videos
-                data_path = self.annotations_dir / self.dset_name / "training.json"
+                data_path = self.annotations_dir / self.dset_name / "processed_dataset_train.json"
             elif mode == "val":  # 457 videos
-                data_path = self.annotations_dir / self.dset_name / "validation.json"
+                data_path = self.annotations_dir / self.dset_name / "processed_dataset_val.json"
             else:
                 raise ValueError(f"Mode must be [train, val] for {self.dset_name}, got {mode}")
         elif self.dset_name == "lol":
