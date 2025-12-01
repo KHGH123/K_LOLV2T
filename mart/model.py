@@ -392,7 +392,7 @@ class BertLayerWithMemory(nn.Module):
         self.memory_projection = nn.Linear(config.intermediate_size, config.hidden_size)
         self.output = BertOutput(config)
 
-    def forward(self, prev_m, hidden_states, attention_mask):
+    def forward(self, prev_m, hidden_states, attention_mask, future_m=None):
         """
         Args:
             prev_m: (N, M, D)
@@ -415,12 +415,23 @@ class BertLayerWithMemory(nn.Module):
         # update memory, use raw attention_mask, no need to hide the text
         updated_m = self.memory_updater(prev_m, intermediate_output, attention_mask)  # (N, M, Di)
 
-        concat_mh = torch.cat([prev_m, intermediate_output], dim=1)  # [(N, M, Di); (N, L, Di)] => [N, M+L, Di]
         bsz, n_memory_cells = prev_m.shape[:2]
-        raw_memory_attention_mask = torch.cat(
-            [attention_mask.new_ones(bsz, n_memory_cells), attention_mask], -1)  # (N, M+L)
+        future_len = 0
+        concat_list = [prev_m]
+        raw_mask_list = [attention_mask.new_ones(bsz, n_memory_cells)]
+        
+        if self.config.type == 1 and future_m is not None:
+            concat_list.append(future_m)
+            future_len = future_m.shape[1]
+            raw_mask_list.append(attention_mask.new_ones(bsz, future_len))
+        
+        concat_list.append(intermediate_output)
+        raw_mask_list.append(attention_mask)
+        
+        concat_mh = torch.cat(concat_list, dim=1)
+        raw_memory_attention_mask = torch.cat(raw_mask_list, -1)
         memory_attention_mask = make_pad_shifted_mask(
-            raw_memory_attention_mask, max_v_len, max_t_len, memory_len=n_memory_cells)
+            raw_memory_attention_mask, max_v_len, max_t_len, memory_len=n_memory_cells + future_len)
         memory_attention_output = self.memory_augmented_attention(
             intermediate_output, concat_mh, concat_mh, memory_attention_mask)  # (N, L, Di)
         memory_attention_output = self.memory_projection(memory_attention_output)  # (N, L, Di) -> (N, L, D)
@@ -435,7 +446,7 @@ class BertEncoderWithMemory(nn.Module):
         super().__init__()
         self.layer = nn.ModuleList([BertLayerWithMemory(config) for _ in range(config.num_hidden_layers)])
 
-    def forward(self, prev_ms, hidden_states, attention_mask, output_all_encoded_layers=True):
+    def forward(self, prev_ms, hidden_states, attention_mask, future_ms=None, output_all_encoded_layers=True):
         """
         Args:
             prev_ms: [(N, M, D), ] * num_hidden_layers or None at first step. Memory states for each layer
@@ -447,7 +458,8 @@ class BertEncoderWithMemory(nn.Module):
         """
         all_encoder_layers = []
         for layer_idx, layer_module in enumerate(self.layer):
-            prev_ms[layer_idx], hidden_states = layer_module(prev_ms[layer_idx], hidden_states, attention_mask)
+            layer_future_m = future_ms[layer_idx] if future_ms is not None else None
+            prev_ms[layer_idx], hidden_states = layer_module(prev_ms[layer_idx], hidden_states, attention_mask, future_m=layer_future_m)
             if output_all_encoded_layers:
                 all_encoder_layers.append(hidden_states)
         if not output_all_encoded_layers:
@@ -1386,11 +1398,15 @@ class RecursiveTransformer(nn.Module):
     def __init__(self, cfg: MartConfig):
         super().__init__()
         self.cfg = cfg
+        if cfg.type == 1: 
+            print('========================type 1==========================')
         self.embeddings = BertEmbeddingsWithVideo(cfg, add_postion_embeddings=True)
         self.encoder = BertEncoderWithMemory(cfg)
         decoder_classifier_weight = self.embeddings.word_embeddings.weight\
             if self.cfg.share_wd_cls_weight else None
         self.decoder = BertLMPredictionHead(cfg, decoder_classifier_weight)
+        # Future prediction decoder
+        self.decoder_future = BertLMPredictionHead(cfg, decoder_classifier_weight)
         if self.cfg.label_smoothing != 0:
             self.loss_func = LabelSmoothingLoss(cfg.label_smoothing, cfg.vocab_size, ignore_index=-1)
         else:
@@ -1413,19 +1429,20 @@ class RecursiveTransformer(nn.Module):
             module.bias.data.zero_()
 
     def forward_step(self, prev_ms, input_ids, video_features, input_masks,
-                     token_type_ids):
+                     token_type_ids, future_m=None):
         """
         single step forward in the recursive structure
         """
         embeddings = self.embeddings(input_ids, video_features, token_type_ids)  # (N, L, D)
 
         prev_ms, encoded_layer_outputs = self.encoder(
-            prev_ms, embeddings, input_masks, output_all_encoded_layers=False)  # both outputs are list
+            prev_ms, embeddings, input_masks, future_ms=future_m, output_all_encoded_layers=False)  # both outputs are list
         prediction_scores = self.decoder(encoded_layer_outputs[-1])  # (N, L, vocab_size)
-        return prev_ms, encoded_layer_outputs, prediction_scores
+        prediction_scores_future = self.decoder_future(encoded_layer_outputs[-1])  # (N, L, vocab_size)
+        return prev_ms, encoded_layer_outputs, prediction_scores, prediction_scores_future
 
     def forward(self, input_ids_list, video_features_list, input_masks_list,
-                token_type_ids_list, input_labels_list, return_memory=False):
+                token_type_ids_list, input_labels_list, future_input_labels_list=None, return_memory=False):
         """
         Args:
             input_ids_list: [(N, L)] * step_size
@@ -1435,6 +1452,8 @@ class RecursiveTransformer(nn.Module):
                 `1` on the last `max_t_len`
             input_labels_list: [(N, L)] * step_size, with `-1` on ignored positions,
                 will not be used when return_memory is True, thus can be None in this case
+            future_input_labels_list: [(N, L)] * step_size, with `-1` on ignored positions,
+                labels for future prediction. If None, future loss will not be computed.
             return_memory: bool,
 
         Returns:
@@ -1442,24 +1461,75 @@ class RecursiveTransformer(nn.Module):
         # [(N, M, D)] * num_hidden_layers, initialized internally
         prev_ms = [None] * self.cfg.num_hidden_layers
         step_size = len(input_ids_list)
-        memory_list = []  # [(N, M, D)] * num_hidden_layers * step_size
-        encoded_outputs_list = []  # [(N, L, D)] * step_size
-        prediction_scores_list = []  # [(N, L, vocab_size)] * step_size
-        for idx in range(step_size):
-            prev_ms, encoded_layer_outputs, prediction_scores =\
-                self.forward_step(prev_ms, input_ids_list[idx], video_features_list[idx],
-                                  input_masks_list[idx], token_type_ids_list[idx])
+        
+        if self.cfg.type == 0:
+            # Original MART: no future memory
+            memory_list = []  # [(N, M, D)] * num_hidden_layers * step_size
+            encoded_outputs_list = []  # [(N, L, D)] * step_size
+            prediction_scores_list = []  # [(N, L, vocab_size)] * step_size
+            
+            for idx in range(step_size):
+                prev_ms, encoded_layer_outputs, prediction_scores, _ =\
+                    self.forward_step(prev_ms, input_ids_list[idx], video_features_list[idx],
+                                      input_masks_list[idx], token_type_ids_list[idx])
 
-            memory_list.append(prev_ms)
-            encoded_outputs_list.append(encoded_layer_outputs)
-            prediction_scores_list.append(prediction_scores)
+                memory_list.append(prev_ms)
+                encoded_outputs_list.append(encoded_layer_outputs)
+                prediction_scores_list.append(prediction_scores)
 
-        if return_memory:  # used to analyze memory
-            return memory_list
-        else:  # normal training/evaluation mode
-            # compute loss, get predicted words
+            if return_memory:  # used to analyze memory
+                return memory_list
+            else:  # normal training/evaluation mode
+                # compute loss, get predicted words
+                caption_loss = 0.
+                for idx in range(step_size):
+                    caption_loss += self.loss_func(prediction_scores_list[idx].view(-1, self.cfg.vocab_size),
+                                                   input_labels_list[idx].view(-1))
+                return caption_loss, prediction_scores_list
+            
+        elif self.cfg.type == 1:
+            # Future memory prediction
+            future_memories_list = []
+            pass1_score_list = []
+
+            # First pass: collect memories
+            for idx in range(step_size):
+                prev_ms, _, prediction_scores, _ =\
+                    self.forward_step(prev_ms, input_ids_list[idx], video_features_list[idx],
+                                      input_masks_list[idx], token_type_ids_list[idx])
+
+                future_memories_list.append([m.clone() for m in prev_ms])
+                pass1_score_list.append(prediction_scores)
+
+            if return_memory:
+                return future_memories_list
+            
+            # Second pass: use future memories
+            prev_ms = [None] * self.cfg.num_hidden_layers
+            prediction_scores_list = []
+            prediction_scores_future_list = []
+            
+            for idx in range(step_size):
+                future_m = future_memories_list[idx + 1] if idx + 1 < step_size else None
+                prev_ms, encoded_layer_outputs, prediction_scores, prediction_scores_future =\
+                    self.forward_step(prev_ms, input_ids_list[idx], video_features_list[idx],
+                                      input_masks_list[idx], token_type_ids_list[idx], future_m=future_m)
+
+                prediction_scores_list.append(prediction_scores)
+                prediction_scores_future_list.append(prediction_scores_future)
+
+            # Compute loss
             caption_loss = 0.
+            future_loss = 0.
             for idx in range(step_size):
                 caption_loss += self.loss_func(prediction_scores_list[idx].view(-1, self.cfg.vocab_size),
                                                input_labels_list[idx].view(-1))
-            return caption_loss, prediction_scores_list
+                if future_input_labels_list is not None and idx + 1 < step_size:
+                    future_loss += self.loss_func(prediction_scores_future_list[idx].view(-1, self.cfg.vocab_size),
+                                                  future_input_labels_list[idx].view(-1))
+            
+            # Combine losses
+            future_loss_weight = getattr(self.cfg, 'future_loss_weight', 0.5)
+            total_loss = caption_loss + future_loss_weight * future_loss
+            
+            return total_loss, prediction_scores_list, prediction_scores_future_list

@@ -124,6 +124,15 @@ class RecursiveCaptionDataset(data.Dataset):
                 data_path = self.annotations_dir / self.dset_name / "validation.json"
             else:
                 raise ValueError(f"Mode must be [train, val] for {self.dset_name}, got {mode}")
+        elif self.dset_name == "lol":
+            if mode == "train":
+                data_path = self.annotations_dir / self.dset_name / "training.json"
+            elif mode == "val":
+                data_path = self.annotations_dir / self.dset_name / "validation.json"
+            elif mode == "test":
+                data_path = self.annotations_dir / self.dset_name / "testing.json"
+            else:
+                raise ValueError(f"Mode must be [train, val, test] for {self.dset_name}, got {mode}")
         else:
             raise ValueError(f"Unknown dataset {self.dset_name}")
 
@@ -238,6 +247,11 @@ class RecursiveCaptionDataset(data.Dataset):
                 elif self.dset_name == "youcook2":
                     cur_path1 = os.path.join(self.video_feature_dir, "{}_rgb.pkl".format(video_name))
                     cur_path2 = os.path.join(self.video_feature_dir, "{}_flow.pkl".format(video_name))
+                elif self.dset_name == "lol":
+                    cur_path1 = os.path.join(self.video_feature_dir, self.mode + "ing", "{}_rgb.pkl".format(video_name))
+                    cur_path2 = os.path.join(self.video_feature_dir, self.mode + "ing", "{}_flow.pkl".format(video_name))
+                else:
+                    cur_path1 = cur_path2 = None
                 for p in [cur_path1, cur_path2]:
                     if not os.path.exists(p):
                         self.missing_video_names.append(video_name)
@@ -247,6 +261,8 @@ class RecursiveCaptionDataset(data.Dataset):
             if self.dset_name == "activitynet":
                 self.data = [e for e in self.data if e["name"][2:] not in self.missing_video_names]
             elif self.dset_name == "youcook2":
+                self.data = [e for e in self.data if e["name"] not in self.missing_video_names]
+            elif self.dset_name == "lol":
                 self.data = [e for e in self.data if e["name"] not in self.missing_video_names]
             else:
                 raise ValueError(f"Dataset not understood {self.dset_name}")
@@ -303,6 +319,17 @@ class RecursiveCaptionDataset(data.Dataset):
         elif self.dset_name == "youcook2":
             rgb_path = os.path.join(self.video_feature_dir, f"{video_name}_rgb.pkl")
             flow_path = os.path.join(self.video_feature_dir, f"{video_name}_flow.pkl")
+
+            with open(rgb_path, "rb") as f:
+                rgb_feat = pickle.load(f)
+
+            with open(flow_path, "rb") as f:
+                flow_feat = pickle.load(f)
+
+            video_feature = np.concatenate([rgb_feat, flow_feat], axis=-1)
+        elif self.dset_name == "lol":
+            rgb_path = os.path.join(self.video_feature_dir, self.mode + "ing", f"{video_name}_rgb.pkl")
+            flow_path = os.path.join(self.video_feature_dir, self.mode + "ing", f"{video_name}_flow.pkl")
 
             with open(rgb_path, "rb") as f:
                 rgb_feat = pickle.load(f)
@@ -393,9 +420,11 @@ class RecursiveCaptionDataset(data.Dataset):
             single_video_features = []
             single_video_meta = []
             for clip_idx in range(num_sen):
+                # Get future sentence for this clip (next clip's sentence, or current if it's the last)
+                future_sentence = example["sentences"][clip_idx + 1] if clip_idx < num_sen - 1 else example["sentences"][clip_idx]
                 cur_data, cur_meta = self.clip_sentence_to_feature(
-                    example["name"], example["timestamps"][clip_idx], example["sentences"][clip_idx], video_feature,
-                    clip_idx)
+                    example["name"], example["timestamps"][clip_idx], example["sentences"][clip_idx], 
+                    future_sentence, video_feature, clip_idx)
                 single_video_features.append(cur_data)
                 single_video_meta.append(cur_meta)
             return single_video_features, single_video_meta
@@ -409,7 +438,7 @@ class RecursiveCaptionDataset(data.Dataset):
             example["name"], example["timestamp"], example["sentence"], video_feature, example["idx"])
         return cur_data, cur_meta
 
-    def clip_sentence_to_feature(self, name, timestamp, sentence, video_feature, clip_idx: int):
+    def clip_sentence_to_feature(self, name, timestamp, sentence, future_sentence, video_feature, clip_idx: int):
         """
         make features for a single clip-sentence pair.
         [CLS], [VID], ..., [VID], [SEP], [BOS], [WORD], ..., [WORD], [EOS]
@@ -417,6 +446,7 @@ class RecursiveCaptionDataset(data.Dataset):
             name: str,
             timestamp: [float, float]
             sentence: str
+            future_sentence: str, the next sentence for future prediction
             video_feature: Either np.array of rgb+flow features or Dict[str, np.array] of COOT embeddings
             clip_idx: clip number in the video (needed to loat COOT features)
         """
@@ -427,6 +457,7 @@ class RecursiveCaptionDataset(data.Dataset):
         # video + text tokens
         feat, video_tokens, video_mask = self._load_indexed_video_feature(video_feature, timestamp, frm2sec, clip_idx)
         text_tokens, text_mask = self._tokenize_pad_sentence(sentence)
+        future_text_tokens, future_text_mask = self._tokenize_pad_sentence(future_sentence)
 
         input_tokens = video_tokens + text_tokens
 
@@ -434,15 +465,23 @@ class RecursiveCaptionDataset(data.Dataset):
         # shifted right, `-1` is ignored when calculating CrossEntropy Loss
         input_labels = [self.IGNORE] * len(video_tokens) + [self.IGNORE if m == 0 else tid for tid, m in zip(
             input_ids[-len(text_mask):], text_mask)][1:] + [self.IGNORE]
+        
+        # Future labels for future prediction
+        future_input_ids = [self.word2idx.get(t, self.word2idx[self.UNK_TOKEN]) for t in future_text_tokens]
+        future_input_labels = [self.IGNORE] * len(video_tokens) + [self.IGNORE if m == 0 else tid for tid, m in zip(
+            future_input_ids, future_text_mask)][1:] + [self.IGNORE]
+        
         input_mask = video_mask + text_mask
         token_type_ids = [0] * self.max_v_len + [1] * self.max_t_len
 
         coll_data = dict(
             name=name, input_tokens=input_tokens, input_ids=np.array(input_ids).astype(np.int64),
-            input_labels=np.array(input_labels).astype(np.int64), input_mask=np.array(input_mask).astype(np.float32),
+            input_labels=np.array(input_labels).astype(np.int64), 
+            future_input_labels=np.array(future_input_labels).astype(np.int64),
+            input_mask=np.array(input_mask).astype(np.float32),
             token_type_ids=np.array(token_type_ids).astype(np.int64), video_feature=feat.astype(np.float32))
         meta = dict(
-            name=name, timestamp=timestamp, sentence=sentence, )
+            name=name, timestamp=timestamp, sentence=sentence, future_sentence=future_sentence)
         return coll_data, meta
 
     def clip_sentence_to_feature_untied(self, name, timestamp, sentence, raw_video_feature, clip_idx):
@@ -682,12 +721,14 @@ class RecursiveCaptionDataset(data.Dataset):
                 cur_meta = dict(
                     name=None,
                     timestamp=[],
-                    gt_sentence=[]
+                    gt_sentence=[],
+                    future_sentence=[]
                 )
                 for d in e:
                     cur_meta["name"] = d["name"]
                     cur_meta["timestamp"].append(d["timestamp"])
                     cur_meta["gt_sentence"].append(d["sentence"])
+                    cur_meta["future_sentence"].append(d.get("future_sentence", d["sentence"]))
                 batch_meta.append(cur_meta)
 
             batch = [e[0] for e in batch]
@@ -699,6 +740,7 @@ class RecursiveCaptionDataset(data.Dataset):
             padding_clip_sen_data = copy.deepcopy(
                 batch[0][0])  # doesn"t matter which one is used
             padding_clip_sen_data["input_labels"][:] = RecursiveCaptionDataset.IGNORE
+            padding_clip_sen_data["future_input_labels"][:] = RecursiveCaptionDataset.IGNORE
             for ele in batch:
                 cur_n_sen = len(ele)
                 if cur_n_sen < max_n_sen:

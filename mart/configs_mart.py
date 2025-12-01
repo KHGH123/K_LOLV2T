@@ -161,6 +161,9 @@ class MartConfig(trainer_configs.BaseExperimentConfig):
         self.xl_grad: bool = config.pop("xl_grad")
         self.use_glove: bool = config.pop("use_glove")
         self.freeze_glove: bool = config.pop("freeze_glove")
+        
+        # model type: 0=original, 1=future memory
+        self.type: int = config.pop("type", 0)
 
         # optimization
         self.ema_decay: float = config.pop("ema_decay")
