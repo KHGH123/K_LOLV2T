@@ -1,7 +1,7 @@
 import json
 
 # 입력 JSON 파일 경로
-input_file = r"annotations\youcook2\validation.json"
+input_file = r"annotations\youcook2\processed_dataset_val.json"
 # 결과 저장할 JSON 파일 경로
 output_file = r"annotations\youcook2\captioning_val_para.json"
 
