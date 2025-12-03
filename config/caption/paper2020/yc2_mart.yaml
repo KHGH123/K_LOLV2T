@@ -2,8 +2,8 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-  batch_size: 16
-  num_epochs: 50
+  batch_size: 8
+  num_epochs: 30
   loss_func: "crossentropy"
   clip_gradient: 1
 label_smoothing: 0.1
@@ -99,7 +99,7 @@ logging:
   step_gpu_once: 10
 # ---------- Saving ----------
 saving:
-  keep_freq: -1
-  save_last: true
+  keep_freq: 1
+  save_last: False
   save_best: true
   save_opt_state: true

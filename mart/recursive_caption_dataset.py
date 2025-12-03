@@ -119,9 +119,9 @@ class RecursiveCaptionDataset(data.Dataset):
                 raise ValueError(f"Mode must be [train, val, test] for {self.dset_name}, got {mode}")
         elif self.dset_name == "youcook2":
             if mode == "train":  # 1333 videos
-                data_path = self.annotations_dir / self.dset_name / "training.json"
+                data_path = self.annotations_dir / self.dset_name / "processed_dataset.json"
             elif mode == "val":  # 457 videos
-                data_path = self.annotations_dir / self.dset_name / "validation.json"
+                data_path = self.annotations_dir / self.dset_name / "processed_dataset_val.json"
             else:
                 raise ValueError(f"Mode must be [train, val] for {self.dset_name}, got {mode}")
         else:
@@ -244,6 +244,7 @@ class RecursiveCaptionDataset(data.Dataset):
             print(f"Missing {len(self.missing_video_names)} features (clips/sentences) "
                   f"from {len(set(self.missing_video_names))} videos")
             print(f"Missing {set(self.missing_video_names)}")
+            print(self.video_feature_dir)
             if self.dset_name == "activitynet":
                 self.data = [e for e in self.data if e["name"][2:] not in self.missing_video_names]
             elif self.dset_name == "youcook2":

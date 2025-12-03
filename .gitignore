@@ -10,6 +10,9 @@
 # ---------- configs_mart.py ----------
 mart/configs_mart.py
 
+# ----------  train_caption.py ----------
+train_caption.py
+
 # big files
 *.npz
 *.h5
