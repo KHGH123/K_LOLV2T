@@ -43,7 +43,7 @@ INF = float('inf')
 
 
 def create_mart_model(cfg: MartConfig, vocab_size: int, cache_dir: str = MartPathConst.CACHE_DIR,
-                      verbose: bool = True) -> nn.Module:
+                      verbose: bool = True, model_type: bool = False) -> nn.Module:
     """
     Args:
         cfg: Experiment config.
@@ -59,10 +59,13 @@ def create_mart_model(cfg: MartConfig, vocab_size: int, cache_dir: str = MartPat
     if cfg.recurrent:
         if cfg.xl:
             logger.info(f"Use recurrent model - TransformerXL with gradient {cfg.xl_grad}")
-            model = TransformerXL(cfg)
+            model = RecursiveTransformer(cfg)
         else:
-            logger.info("Use recurrent model - Mine")
-            model = BiDirectionalRecursiveTransformer(cfg)
+            if model_type:
+                logger.info("Use recurrent model - Mine")
+                model = RecursiveTransformer(cfg)
+            else:
+                model = BiDirectionalRecursiveTransformer(cfg)
     else:  # single sentence, including untied
         if cfg.untied:
             logger.info("Use untied non-recurrent single sentence model")
@@ -1500,7 +1503,13 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             self.loss_func = LabelSmoothingLoss(cfg.label_smoothing, cfg.vocab_size, ignore_index=-1)
         else:
             self.loss_func = nn.CrossEntropyLoss(ignore_index=-1)
-
+    
+    def forward_step(self, prev_ms, input_ids, video_features, input_masks, token_type_ids):
+        """
+        validation/test 시에 한 스텝만 forward 하는 함수
+        """
+        return self.fwd_model.forward_step(prev_ms, input_ids, video_features, input_masks, token_type_ids)
+    
     def forward(self, input_ids_list, video_features_list, input_masks_list,
                 token_type_ids_list, input_labels_list):
         """
@@ -1547,7 +1556,6 @@ class BiDirectionalRecursiveTransformer(nn.Module):
 
         # backward 결과를 다시 원래 step 순서로 되돌리기
         bwd_hidden_list = list(reversed(bwd_hidden_list_rev))
-        # (필요하다면 bwd_scores_list도 되돌릴 수 있음, 지금은 hidden만 사용)
 
         # FM_t, BM_t를 게이트로 섞기
         fused_scores_list = []

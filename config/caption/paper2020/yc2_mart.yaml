@@ -2,8 +2,8 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-  batch_size: 16
-  num_epochs: 3
+  batch_size: 8
+  num_epochs: 30
   loss_func: "crossentropy"
   clip_gradient: 1
 label_smoothing: 0.1
@@ -37,7 +37,7 @@ dataset_train:
   max_datapoints: -1
   shuffle: true
   pin_memory: true
-  num_workers: 0
+  num_workers: 4
   drop_last: false
   preload: false
 dataset_val:
