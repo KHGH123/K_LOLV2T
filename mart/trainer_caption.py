@@ -158,6 +158,13 @@ class MartTrainer(trainer_base.BaseTrainer):
         self.model_mgr: MartModelManager = self.model_mgr
         self.exp: MartFilesHandler = self.exp
 
+        #---------- keywords for importance labeling ----------
+        self.KEYWORDS =  [
+            "kill", "killed", "picks up",
+            "baron", "dragon", "drake", "elder",
+            "tower", "turret", "inhibitor",
+        ]
+
         # # overwrite default state with inherited trainer state in case we need additional state fields
         # self.state = RetrievalTrainerState()
 
@@ -227,6 +234,42 @@ class MartTrainer(trainer_base.BaseTrainer):
         if self.load_model or cfg.ema_decay <= 0:
             self.ema = None
 
+    def contains_keyword(self, text):
+        text = text.lower()
+        return any(k in text for k in self.KEYWORDS)
+
+
+    def build_importance_labels(self, input_labels_list, gt_sentences_list):
+        """
+        input_labels_list: [(N, L)] * step_size
+        gt_sentences_list: length = step_size, list of string (GT captions)
+
+        Return:
+            importance_labels_list: [(N, L)] * step_size (float tensor)
+        """
+
+        step_size = len(input_labels_list)
+        N, L = input_labels_list[0].shape
+
+        importance_labels_list = []
+
+        # 미래 이벤트 기반 importance 설정
+        for t in range(step_size):
+            importance_flag = 0
+
+            # 미래 step들의 GT 문장을 검색
+            for future_t in range(t + 1, min(t + 4, step_size)):  # 3-step 미래까지 검사 (hyperparam)
+                if self.contains_keyword(gt_sentences_list[future_t]):
+                    importance_flag = 1
+                    break
+
+            # importance_flag = 0 or 1
+            importance_tensor = th.full((N, L), float(importance_flag))
+
+            importance_labels_list.append(importance_tensor)
+
+        return importance_labels_list
+
     def train_model(self, train_loader: data.DataLoader, val_loader: data.DataLoader) -> None:
         """
         Train epochs until done.
@@ -273,6 +316,9 @@ class MartTrainer(trainer_base.BaseTrainer):
                         input_masks_list = [e["input_mask"] for e in batched_data]
                         token_type_ids_list = [e["token_type_ids"] for e in batched_data]
                         input_labels_list = [e["input_labels"] for e in batched_data]
+                        gt_sentences = [e["gt_sentences"] for e in batched_data]
+                        # build importance labels
+                        importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences)
 
                         if self.cfg.debug:
                             cur_data = batched_data[step]
@@ -459,8 +505,12 @@ class MartTrainer(trainer_base.BaseTrainer):
                     token_type_ids_list = [e["token_type_ids"] for e in
                                            batched_data]
                     input_labels_list = [e["input_labels"] for e in batched_data]
+                    gt_sentences = [e["gt_sentences"] for e in batched_data]
+                    # build importance labels
+                    importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences)                
+
                     loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
-                                                        token_type_ids_list, input_labels_list)
+                                                        token_type_ids_list, input_labels_list, importance_labels_list)
                     # translate (no ground truth text)
                     step_sizes = batch[1]  # list(int), len == bsz
                     meta = batch[2]  # list(dict), len == bsz

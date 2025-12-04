@@ -1503,6 +1503,11 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             self.loss_func = LabelSmoothingLoss(cfg.label_smoothing, cfg.vocab_size, ignore_index=-1)
         else:
             self.loss_func = nn.CrossEntropyLoss(ignore_index=-1)
+        
+        self.importance_head = nn.Linear(cfg.hidden_size, 1)
+        self.importance_loss_func = nn.BCEWithLogitsLoss()
+
+        self.importance_loss_weight = 0.5
     
     def forward_step(self, prev_ms, input_ids, video_features, input_masks, token_type_ids):
         """
@@ -1511,7 +1516,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         return self.fwd_model.forward_step(prev_ms, input_ids, video_features, input_masks, token_type_ids)
     
     def forward(self, input_ids_list, video_features_list, input_masks_list,
-                token_type_ids_list, input_labels_list):
+                token_type_ids_list, input_labels_list, importance_labels_list=None):
         """
         Args:
             input_ids_list: [(N, L)] * step_size
@@ -1559,6 +1564,10 @@ class BiDirectionalRecursiveTransformer(nn.Module):
 
         # FM_t, BM_t를 게이트로 섞기
         fused_scores_list = []
+        importance_scores_list = []
+
+        caption_loss_total = 0.0
+        importance_loss_total = 0.0
         total_loss = 0.0
 
         for idx in range(step_size):
@@ -1582,4 +1591,41 @@ class BiDirectionalRecursiveTransformer(nn.Module):
                 input_labels_list[idx].view(-1)
             )
 
-        return total_loss, fused_scores_list
+            #   fused_h -> (N, L, 1) -> (N, L)
+            importance_logits = self.importance_head(fused_h).squeeze(-1)
+            importance_scores_list.append(importance_logits)
+
+            # importance_labels_list가 주어졌을 때만 importance loss 계산
+            if importance_labels_list is not None:
+                importance_labels = importance_labels_list[idx]  # (N, L)
+
+                # pad 위치를 -1로 두고 무시하고 싶다면:
+                if importance_labels.dtype != torch.float32:
+                    importance_labels = importance_labels.float()
+
+                if (importance_labels == -1).any():
+                    # -1인 위치는 손실 계산에서 제외
+                    mask = (importance_labels != -1)
+                    if mask.any():
+                        imp_loss = self.importance_loss_fn(
+                            importance_logits[mask],
+                            importance_labels[mask],
+                        )
+                    else:
+                        imp_loss = 0.0 * caption_loss_total  # gradient 끊기용 더미
+                else:
+                    # 전체가 유효한 0/1 레이블이면 그대로 사용
+                    imp_loss = self.importance_loss_fn(
+                        importance_logits,
+                        importance_labels,
+                    )
+
+                importance_loss_total += imp_loss
+
+        # 4) 최종 loss: 캡션 + α * 중요도
+        if importance_labels_list is not None and self.importance_loss_weight > 0:
+            total_loss = caption_loss_total + self.importance_loss_weight * importance_loss_total
+        else:
+            total_loss = caption_loss_total
+
+        return total_loss, fused_scores_list, importance_scores_list
