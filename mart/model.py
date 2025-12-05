@@ -1490,7 +1490,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         self.bwd_model = RecursiveTransformer(cfg)
 
         # 파라미터 공유
-        # 동일한 encoder/decoder/embedding을 공유해서 파라미터 수를 늘리지 않을 수도 있음
+        # 동일한 encoder/decoder/embedding을 공유해서 파라미터 수 줄이기
         self.bwd_model.embeddings = self.fwd_model.embeddings
         self.bwd_model.encoder = self.fwd_model.encoder
         self.bwd_model.decoder = self.fwd_model.decoder
@@ -1503,6 +1503,11 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             self.loss_func = LabelSmoothingLoss(cfg.label_smoothing, cfg.vocab_size, ignore_index=-1)
         else:
             self.loss_func = nn.CrossEntropyLoss(ignore_index=-1)
+        
+        self.importance_head = nn.Linear(cfg.hidden_size, 1)
+        self.importance_loss_fn = nn.BCEWithLogitsLoss()
+
+        self.importance_loss_weight = 0.5
     
     def forward_step(self, prev_ms, input_ids, video_features, input_masks, token_type_ids):
         """
@@ -1511,7 +1516,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         return self.fwd_model.forward_step(prev_ms, input_ids, video_features, input_masks, token_type_ids)
     
     def forward(self, input_ids_list, video_features_list, input_masks_list,
-                token_type_ids_list, input_labels_list):
+                token_type_ids_list, input_labels_list, importance_labels_list=None, past_memory=None):
         """
         Args:
             input_ids_list: [(N, L)] * step_size
@@ -1527,14 +1532,15 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         step_size = len(input_ids_list)
 
         # Forward MART 
-        fwd_loss, fwd_scores_list, fwd_hidden_list = self.fwd_model(
+        fwd_loss, fwd_scores_list, fwd_hidden_list, new_fwd_memory= self.fwd_model(
             input_ids_list,
             video_features_list,
             input_masks_list,
             token_type_ids_list,
             input_labels_list,
             return_memory=False,
-            return_hidden=True
+            return_hidden=True,
+            past_memory=past_memory
         )
 
         # Backward MART
@@ -1544,14 +1550,15 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         rev_token_type_ids_list = list(reversed(token_type_ids_list))
         rev_input_labels_list = list(reversed(input_labels_list))
 
-        bwd_loss, bwd_scores_list_rev, bwd_hidden_list_rev = self.bwd_model(
+        bwd_loss, bwd_scores_list_rev, bwd_hidden_list_rev, _ = self.bwd_model(
             rev_input_ids_list,
             rev_video_features_list,
             rev_input_masks_list,
             rev_token_type_ids_list,
             rev_input_labels_list,
             return_memory=False,
-            return_hidden=True
+            return_hidden=True,
+            past_memory=past_memory
         )
 
         # backward 결과를 다시 원래 step 순서로 되돌리기
@@ -1559,6 +1566,10 @@ class BiDirectionalRecursiveTransformer(nn.Module):
 
         # FM_t, BM_t를 게이트로 섞기
         fused_scores_list = []
+        importance_scores_list = []
+
+        caption_loss_total = 0.0
+        importance_loss_total = 0.0
         total_loss = 0.0
 
         for idx in range(step_size):
@@ -1577,9 +1588,45 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             fused_scores_list.append(logits)
 
             # 이 fused logits 기준으로 최종 loss 계산
-            total_loss += self.loss_func(
+            caption_loss_total += self.loss_func(
                 logits.view(-1, self.cfg.vocab_size),
                 input_labels_list[idx].view(-1)
             )
 
-        return total_loss, fused_scores_list
+            #   fused_h -> (N, L, 1) -> (N, L)
+            importance_logits = self.importance_head(fused_h).squeeze(-1)
+            importance_scores_list.append(importance_logits)
+
+            if importance_labels_list is not None:
+                importance_labels = importance_labels_list[idx]  # (N, L)
+
+                # pad 위치를 -1로 두고 무시하고 싶다면:
+                if importance_labels.dtype != torch.float32:
+                    importance_labels = importance_labels.float()
+
+                if (importance_labels == -1).any():
+                    # -1인 위치는 손실 계산에서 제외
+                    mask = (importance_labels != -1)
+                    if mask.any():
+                        imp_loss = self.importance_loss_fn(
+                            importance_logits[mask],
+                            importance_labels[mask],
+                        )
+                    else:
+                        imp_loss = 0.0 * caption_loss_total  # gradient 끊기용 더미
+                else:
+                    # 전체가 유효한 0/1 레이블이면 그대로 사용
+                    imp_loss = self.importance_loss_fn(
+                        importance_logits,
+                        importance_labels,
+                    )
+
+                importance_loss_total += imp_loss
+
+        # 4) 최종 loss: 캡션 + α * 중요도
+        if importance_labels_list is not None and self.importance_loss_weight > 0:
+            total_loss = caption_loss_total + self.importance_loss_weight * importance_loss_total
+        else:
+            total_loss = caption_loss_total
+
+        return total_loss, fused_scores_list, new_fwd_memory

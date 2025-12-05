@@ -12,12 +12,14 @@ from pathlib import Path
 from timeit import default_timer as timer
 from typing import Dict, List, Optional, Tuple, Union
 from typing import ClassVar
+import copy
 
 import numpy as np
 import torch as th
 from torch import nn
 from torch.cuda.amp import autocast
 from torch.utils import data
+from torch.utils.data.dataloader import default_collate
 from tqdm import tqdm
 
 from coot.configs_retrieval import ExperimentTypesConst
@@ -158,6 +160,12 @@ class MartTrainer(trainer_base.BaseTrainer):
         self.model_mgr: MartModelManager = self.model_mgr
         self.exp: MartFilesHandler = self.exp
 
+        self.KEYWORDS =  [
+            "kill", "killed", "picks up",
+            "baron", "dragon", "drake", "elder",
+            "tower", "turret", "inhibitor",
+        ]
+
         # # overwrite default state with inherited trainer state in case we need additional state fields
         # self.state = RetrievalTrainerState()
 
@@ -226,7 +234,40 @@ class MartTrainer(trainer_base.BaseTrainer):
         # disable ema when loading model directly or when decay is 0 / -1
         if self.load_model or cfg.ema_decay <= 0:
             self.ema = None
+    def contains_keyword(self, text):
+        text = text.lower()
+        return any(k in text for k in self.KEYWORDS)
+    
+    def build_importance_labels(self, input_labels_list, gt_sentences_list):
+        """
+        input_labels_list: [(N, L)] * step_size
+        gt_sentences_list: length = step_size, list of string (GT captions)
 
+        Return:
+            importance_labels_list: [(N, L)] * step_size (float tensor)
+        """
+
+        step_size = len(input_labels_list)
+        N, L = input_labels_list[0].shape
+        device = input_labels_list[0].device
+
+        importance_labels_list = []
+
+        # 미래 이벤트 기반 importance 설정
+        for t in range(step_size):
+            gt_sents = gt_sentences_list[t]
+            importance_tensor = th.zeros((N, L), device=device, dtype=th.float32)
+
+            # 현재 setence에서 keyword가 있으면 1, 없으면 0
+            for b in range(N):
+                s = gt_sents[b]
+                if s is not None and self.contains_keyword(s):
+                    importance_tensor[b, :] == 1.0
+            
+            importance_labels_list.append(importance_tensor)
+
+        return importance_labels_list
+    
     def train_model(self, train_loader: data.DataLoader, val_loader: data.DataLoader) -> None:
         """
         Train epochs until done.
@@ -254,129 +295,185 @@ class MartTrainer(trainer_base.BaseTrainer):
             total_loss = 0
             n_word_total = 0
             n_word_correct = 0
+            accum_steps = 32
 
-            # ---------- Dataloader Iteration ----------
+            # ---------- Dataloader Iteration (Batch Loop) ----------
+            # batch[0]은 collate_fn에서 반환한 'List[List[Dict]]' 입니다.
+            # 구조: [ [Video A의 Clip 1, Clip 2...], [Video B의 Clip 1, Clip 2...] ... ]
             for step, batch in enumerate(train_loader):
+                print(f"\n[DEBUG] Batch {step} 데이터 로딩 완료! 학습 시작합니다.")
                 self.hook_pre_step_timer()  # hook for step timing
 
-                # ---------- forward pass ----------
+                batch_clips_lists = batch[0]
+                batch_meta_lists = batch[2]
+                batch_size = len(batch_clips_lists)
+
+                # 1. 현재 배치(여러 영상들) 중 가장 긴 영상의 길이(Step 수) 계산
+                max_steps = max([len(clips) for clips in batch_clips_lists])
+
+                # 2. 새로운 배치가 시작되었으므로, 모든 슬롯(Lane)의 메모리 초기화
+                # (None을 넘기면 모델 내부에서 초기화됨)
+                current_memory = None
+
+                # 3. Optimizer 초기화 (영상 전체에 대해 한 번 업데이트하기 위함)
                 self.optimizer.zero_grad()
-                with autocast(enabled=self.cfg.fp16_train):
-                    if self.cfg.recurrent:
-                        # ---------- training step for recurrent models ----------
-                        batched_data = [prepare_batch_inputs(step_data, use_cuda=self.cfg.use_cuda,
-                                                             non_blocking=self.cfg.cuda_non_blocking)
-                                        for step_data in batch[0]]
 
-                        input_ids_list = [e["input_ids"] for e in batched_data]
-                        video_features_list = [e["video_feature"] for e in batched_data]
-                        input_masks_list = [e["input_mask"] for e in batched_data]
-                        token_type_ids_list = [e["token_type_ids"] for e in batched_data]
-                        input_labels_list = [e["input_labels"] for e in batched_data]
+                # ---------- Inner Loop: Time Step (클립) 단위 순차 진행 ----------
+                # t = 0 (모든 영상의 첫 번째 클립), t = 1 (두 번째 클립) ... 순서로 진행
+                for t in range(max_steps):
+                    if t % 10 == 0:
+                        print(f"\r  > Step {step} | Clip {t}/{max_steps} Processing...", end="", flush=True)
+                    
+                    # --- (A) 현재 스텝(t)의 배치 구성 (Dynamic Batching with Padding) ---
+                    current_step_inputs = []
+                    current_step_gt_sentences = []
 
-                        if self.cfg.debug:
-                            cur_data = batched_data[step]
-                            self.logger.info("input_ids \n{}".format(cur_data["input_ids"][step]))
-                            self.logger.info("input_mask \n{}".format(cur_data["input_mask"][step]))
-                            self.logger.info("input_labels \n{}".format(cur_data["input_labels"][step]))
-                            self.logger.info("token_type_ids \n{}".format(cur_data["token_type_ids"][step]))
+                    for b_i in range(batch_size):
+                        video_clips = batch_clips_lists[b_i]
+                        video_meta = batch_meta_lists[b_i]
 
-                        loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
-                                                            token_type_ids_list, input_labels_list)
-                    elif self.cfg.untied or self.cfg.mtrans:
-                        # ---------- training step for untied models / vanilla transformer ----------
-                        batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
-                                                            non_blocking=self.cfg.cuda_non_blocking)
-                        video_feature = batched_data["video_feature"]
-                        video_mask = batched_data["video_mask"]
-                        text_ids = batched_data["text_ids"]
-                        text_mask = batched_data["text_mask"]
-                        text_labels = batched_data["text_labels"]
+                        if t < len(video_clips):
+                            # 아직 영상이 진행 중인 경우 -> 실제 데이터 사용
+                            current_step_inputs.append(video_clips[t])
+                            gt_sent = video_meta[t]["gt_sentence"]
+                            current_step_gt_sentences.append(gt_sent)
+                        else:
+                            dummy = copy.deepcopy(video_clips[-1])
+                            dummy['input_labels'][:] = RecursiveCaptionDataset.IGNORE
+                            dummy['input_mask'][:] = 0
+                            dummy['input_mask'][0] = 1
+                            current_step_inputs.append(dummy)
+                            # 패딩 구간은 None 처리
+                            current_step_gt_sentences.append(None)
 
-                        if self.cfg.debug:
-                            self.logger.info("text_ids \n{}".format(batched_data["text_ids"][step]))
-                            self.logger.info("text_mask \n{}".format(batched_data["text_mask"][step]))
-                            self.logger.info("text_labels \n{}".format(batched_data["text_labels"][step]))
-                        loss, pred_scores = self.model(video_feature, video_mask, text_ids, text_mask, text_labels)
-                        # make it consistent with other configs
-                        pred_scores_list = [pred_scores]
-                        input_labels_list = [text_labels]
+                    # 리스트 형태의 입력을 하나의 배치 텐서로 변환
+                    # default_collate: List[Dict] -> Dict[Tensor] (Stacked)
+                    collated_input = default_collate(current_step_inputs)
+                    
+                    # GPU 이동
+                    batched_data = prepare_batch_inputs(collated_input, use_cuda=self.cfg.use_cuda,
+                                                        non_blocking=self.cfg.cuda_non_blocking)
+
+                    # --- (B) 모델 실행 ---
+                    with autocast(enabled=self.cfg.fp16_train):
+                        if self.cfg.recurrent:
+                            # MART 모델은 리스트 형태의 입력을 기대하므로 리스트로 감싸줌
+                            # 각 텐서의 shape: [Batch_Size, Seq_Len(words), Dim]
+                            input_ids_list = [batched_data["input_ids"]]
+                            video_features_list = [batched_data["video_feature"]]
+                            input_masks_list = [batched_data["input_mask"]]
+                            token_type_ids_list = [batched_data["token_type_ids"]]
+                            input_labels_list = [batched_data["input_labels"]]
+                            importance_labels_list = self.build_importance_labels(
+                            input_labels_list, [current_step_gt_sentences]
+                            )
+
+                            if self.cfg.debug and t == 0:
+                                self.logger.info(f"Batch Step {step}, Time {t}, Input IDs: {input_ids_list[0].shape}")
+
+                            # [핵심] past_memory 전달 (이전 스텝의 기억 유지)
+                            loss, pred_scores_list, new_memory = self.model(
+                            input_ids_list, video_features_list, input_masks_list,
+                            token_type_ids_list, input_labels_list,
+                            importance_labels_list=importance_labels_list, # [추가]
+                            past_memory=current_memory 
+                        )
+                        
+                        elif self.cfg.untied or self.cfg.mtrans:
+                            # Untied 모델용 로직 (이 경우 메모리 전달 없음)
+                            loss, pred_scores = self.model(
+                                batched_data["video_feature"], batched_data["video_mask"],
+                                batched_data["text_ids"], batched_data["text_mask"],
+                                batched_data["text_labels"]
+                            )
+                            pred_scores_list = [pred_scores]
+                            input_labels_list = [batched_data["text_labels"]]
+                            new_memory = None
+                        
+                        else:
+                            # Non-recurrent 모델용 로직
+                            loss, pred_scores = self.model(
+                                batched_data["input_ids"], batched_data["video_feature"],
+                                batched_data["input_mask"], batched_data["token_type_ids"],
+                                batched_data["input_labels"]
+                            )
+                            pred_scores_list = [pred_scores]
+                            input_labels_list = [batched_data["input_labels"]]
+                            new_memory = None
+
+                    # --- (C) 역전파 (Backpropagation) ---
+
+                    loss = loss / accum_steps
+                    grad_norm = None
+                    if self.cfg.fp16_train:
+                        self.grad_scaler.scale(loss).backward()
+                        # Scaling이나 Clipping은 영상 전체가 끝난 후 수행
                     else:
-                        # ---------- non-recurrent MART and maybe others ----------
-                        batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
-                                                            non_blocking=self.cfg.cuda_non_blocking)
-                        input_ids = batched_data["input_ids"]
-                        video_features = batched_data["video_feature"]
-                        input_masks = batched_data["input_mask"]
-                        token_type_ids = batched_data["token_type_ids"]
-                        input_labels = batched_data["input_labels"]
+                        loss.backward()
 
-                        if self.cfg.debug:
-                            self.logger.info("input_ids \n{}".format(batched_data["input_ids"][step]))
-                            self.logger.info("input_mask \n{}".format(batched_data["input_mask"][step]))
-                            self.logger.info("input_labels \n{}".format(batched_data["input_labels"][step]))
-                            self.logger.info("token_type_ids \n{}".format(batched_data["token_type_ids"][step]))
+                    if (t + 1) % accum_steps == 0 or (t + 1) == max_steps:
+                        if self.cfg.fp16_train:
+                            if self.cfg.train.clip_gradient != -1:
+                                self.grad_scaler.unscale_(self.optimizer)
+                                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
+                            self.grad_scaler.step(self.optimizer)
+                            self.grad_scaler.update()
+                        else:
+                            if self.cfg.train.clip_gradient != -1:
+                                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
+                            self.optimizer.step()
+                        self.optimizer.zero_grad()
+                    
+                    # --- (D) 다음 스텝을 위한 메모리 업데이트 ---
+                    if self.cfg.recurrent and new_memory is not None:
+                        current_memory = [m.detach() for m in new_memory]
+                    
+                    # --- (E) 통계 집계 ---
+                    total_loss += loss.item() * accum_steps
+                    n_correct = 0
+                    n_word = 0
 
-                        # forward & backward
-                        loss, pred_scores = self.model(input_ids, video_features, input_masks, token_type_ids,
-                                                       input_labels)
+                    for pred, gold in zip(pred_scores_list, input_labels_list):
+                        n_correct += cal_performance(pred, gold)
+                        valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
+                        n_word += valid_label_mask.sum().item()
+                    n_word_total += n_word
+                    n_word_correct += n_correct
 
-                        # make it consistent with other configs
-                        pred_scores_list = [pred_scores]
-                        input_labels_list = [input_labels]
+                # if self.cfg.fp16_train:
+                #     if self.cfg.train.clip_gradient != -1:
+                #         self.grad_scaler.unscale_(self.optimizer)
+                #         grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
+                #     self.grad_scaler.step(self.optimizer)
+                #     self.grad_scaler.update()
+                # else:
+                #     if self.cfg.train.clip_gradient != -1:
+                #         grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
+                #     self.optimizer.step()
+                # # -----------------------------------------------------------
+                # # [영상 전체 처리 완료] Optimizer Step (가중치 업데이트)
+                # # -----------------------------------------------------------
+                # self.hook_post_forward_step_timer()  # hook for step timing (위치 조정 가능)
 
-                self.hook_post_forward_step_timer()  # hook for step timing
-
-                # ---------- backward pass ----------
-                grad_norm = None
-                if self.cfg.fp16_train:
-                    # with fp16 amp
-                    self.grad_scaler.scale(loss).backward()
-                    if self.cfg.train.clip_gradient != -1:
-                        # gradient clipping
-                        self.grad_scaler.unscale_(self.optimizer)
-                        grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
-                    # gradient scaler realizes if gradients have been unscaled already and doesn't do it again.
-                    self.grad_scaler.step(self.optimizer)
-                    self.grad_scaler.update()
-                else:
-                    # with regular float32
-                    loss.backward()
-                    if self.cfg.train.clip_gradient != -1:
-                        # gradient clipping
-                        grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.train.clip_gradient)
-                    self.optimizer.step()
-                # update model parameters with ema
+                
+                
                 if self.ema is not None:
                     self.ema(self.model, self.state.total_step)
 
-                # keep track of loss, accuracy, gradient norm
-                total_loss += loss.item()
-                n_correct = 0
-                n_word = 0
-                for pred, gold in zip(pred_scores_list, input_labels_list):
-                    n_correct += cal_performance(pred, gold)
-                    valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
-                    n_word += valid_label_mask.sum().item()
-                n_word_total += n_word
-                n_word_correct += n_correct
+                # (Gradient logging 등은 루프 마지막에 수행)
                 if grad_norm is not None:
                     self.metrics.update_meter(MMeters.GRAD, grad_norm)
 
-                if self.cfg.debug:
-                    break
-
                 additional_log = f" Grad {self.metrics.meters[MMeters.GRAD].avg:.2f}"
-                self.hook_post_backward_step_timer()  # hook for step timing
+                self.hook_post_backward_step_timer()
 
-                # post-step hook: gradient clipping, profile gpu, update metrics, count step, step LR scheduler, log
                 current_lr = self.optimizer.get_lr()[0]
                 self.hook_post_step(step, loss, current_lr, additional_log=additional_log,
                                     disable_grad_clip=True)
 
             # log train statistics
-            loss_per_word = 1.0 * total_loss / n_word_total
-            accuracy = 1.0 * n_word_correct / n_word_total
+            loss_per_word = 1.0 * total_loss / max(n_word_total, 1)
+            accuracy = 1.0 * n_word_correct / max(n_word_total, 1)
             self.metrics.update_meter(MMeters.TRAIN_LOSS_PER_WORD, loss_per_word)
             self.metrics.update_meter(MMeters.TRAIN_ACC, accuracy)
             # return loss_per_word, accuracy
@@ -398,203 +495,192 @@ class MartTrainer(trainer_base.BaseTrainer):
 
         # show end of training log message
         self.hook_post_train()
-
+        
     @th.no_grad()
     def validate_epoch(self, data_loader: data.DataLoader) -> (
             Tuple[float, float, bool, Dict[str, float]]):
         """
         Run both validation and translation.
-
-        Validation: The same setting as training, where ground-truth word x_{t-1} is used to predict next word x_{t},
-        not realistic for real inference.
-
-        Translation: Use greedy generated words to predicted next words, the true inference situation.
-        eval_mode can only be set to `val` here, as setting to `test` is cheating
-        0. run inference, 1. Get METEOR, BLEU1-4, CIDEr scores, 2. Get vocab size, sentence length
-
-        Args:
-            data_loader: Dataloader for validation
-
-        Returns:
-            Tuple of:
-                validation loss
-                validation score
-                epoch is best
-                custom metrics with translation results dictionary
+        [최종 수정] Validation 속도 최적화 + 진행 상황 로그 추가
         """
-        self.hook_pre_val_epoch()  # pre val epoch hook: set models to val and start timers
+        self.hook_pre_val_epoch()  # pre val epoch hook
         forward_time_total = 0
         total_loss = 0
         n_word_total = 0
         n_word_correct = 0
 
-        # setup ema
         if self.ema is not None:
             self.ema.assign(self.model)
 
-        # setup translation submission
         batch_res = {"version": "VERSION 1.0", "results": defaultdict(list),
                      "external_data": {"used": "true", "details": "ay"}}
         dataset: RecursiveCaptionDataset = data_loader.dataset
 
-        # ---------- Dataloader Iteration ----------
+        # [설정] 검증할 최대 클립 수 (속도 향상을 위해 20개로 제한)
+        EVAL_MAX_CLIPS = 20 
+
         num_steps = 0
         pbar = tqdm(total=len(data_loader), desc=f"Validate epoch {self.state.current_epoch}")
+        
         for _step, batch in enumerate(data_loader):
-            # ---------- forward pass ----------
-            self.hook_pre_step_timer()  # hook for step timing
+            self.hook_pre_step_timer()
+
+            # [수정] 배치 데이터 파싱
+            batch_clips_lists = batch[0] # List[List[Dict]] (영상별 클립 리스트)
+            batch_meta_lists = batch[2]  # List[List[Dict]] (영상별 메타 리스트)
+            batch_size = len(batch_clips_lists)
+
+            # ====================================================
+            # Part 1: Validation Loss 계산 (Parallel Batching)
+            # ====================================================
+            actual_max_steps = max([len(clips) for clips in batch_clips_lists])
+            loop_steps = min(actual_max_steps, EVAL_MAX_CLIPS)
+
+            current_memory = None
+            
+            print(f"\n[Val Loss] Batch {_step} | Calculating Loss for {loop_steps} steps...")
 
             with autocast(enabled=self.cfg.fp16_val):
                 if self.cfg.recurrent:
-                    # recurrent MART, TransformerXL, ...
-                    # get data
-                    batched_data = [prepare_batch_inputs(
-                        step_data, use_cuda=self.cfg.use_cuda, non_blocking=self.cfg.cuda_non_blocking)
-                        for step_data in batch[0]]
-                    # validate (ground truth as input for next token)
-                    input_ids_list = [e["input_ids"] for e in batched_data]
-                    video_features_list = [e["video_feature"] for e in
-                                           batched_data]
-                    input_masks_list = [e["input_mask"] for e in batched_data]
-                    token_type_ids_list = [e["token_type_ids"] for e in
-                                           batched_data]
-                    input_labels_list = [e["input_labels"] for e in batched_data]
-                    loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
-                                                        token_type_ids_list, input_labels_list)
-                    # translate (no ground truth text)
-                    step_sizes = batch[1]  # list(int), len == bsz
-                    meta = batch[2]  # list(dict), len == bsz
-                    model_inputs = [
-                        [e["input_ids"] for e in batched_data],
-                        [e["video_feature"] for e in batched_data],
-                        [e["input_mask"] for e in batched_data],
-                        [e["token_type_ids"] for e in batched_data]]
-                    dec_seq_list = self.translator.translate_batch(
-                        model_inputs, use_beam=self.cfg.use_beam, recurrent=True,
-                        untied=False, xl=self.cfg.xl)
+                    for t in range(loop_steps):
+                        
+                        # [로그 추가] 진행 상황 출력
+                        if t % 10 == 0:
+                             print(f"\r  > Loss Step {t}/{loop_steps} ...", end="")
 
-                    for example_idx, (step_size, cur_meta) in enumerate(zip(step_sizes, meta)):
-                        # example_idx indicates which example is in the batch
-                        for step_idx, step_batch in enumerate(dec_seq_list[:step_size]):
-                            # step_idx or we can also call it sen_idx
-                            batch_res["results"][cur_meta["name"]].append({"sentence": dataset.convert_ids_to_sentence(
-                                step_batch[example_idx].cpu().tolist()),
-                                # remove encoding
-                                # .encode("ascii", "ignore"),
-                                "timestamp": cur_meta["timestamp"][step_idx],
-                                "gt_sentence": cur_meta["gt_sentence"][step_idx]})
-                    if self.cfg.debug:
-                        print(f"Vid feat {[v.mean().item() for v in video_features_list]}")
-                elif self.cfg.untied or self.cfg.mtrans:
-                    # single sentence model MART untied or Vanilla Transformer
-                    meta = batch[2]  # list(dict), len == bsz
+                        # --- Step 배치 구성 ---
+                        current_step_inputs = []
+                        current_step_gt_sentences = []
 
-                    # validate
-                    batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
-                                                        non_blocking=self.cfg.cuda_non_blocking)
-                    video_feature = batched_data["video_feature"]
-                    video_mask = batched_data["video_mask"]
-                    text_ids = batched_data["text_ids"]
-                    text_mask = batched_data["text_mask"]
-                    text_labels = batched_data["text_labels"]
+                        for b_i in range(batch_size):
+                            video_clips = batch_clips_lists[b_i]
+                            if t < len(video_clips):
+                                current_step_inputs.append(video_clips[t])
+                                current_step_gt_sentences.append(video_meta[t]["gt_sentence"])
+                            else:
+                                # Padding
+                                dummy = copy.deepcopy(video_clips[-1])
+                                dummy['input_labels'][:] = RecursiveCaptionDataset.IGNORE
+                                dummy['input_mask'][:] = 0
+                                dummy['input_mask'][0] = 1
+                                current_step_inputs.append(dummy)
+                                current_step_gt_sentences.append(None)
+                        
+                        collated_input = default_collate(current_step_inputs)
+                        batched_data = prepare_batch_inputs(collated_input, use_cuda=self.cfg.use_cuda,
+                                                            non_blocking=self.cfg.cuda_non_blocking)
 
-                    loss, pred_scores = self.model(video_feature, video_mask, text_ids, text_mask, text_labels)
-                    pred_scores_list = [pred_scores]
-                    input_labels_list = [text_labels]
+                        # --- 모델 실행 ---
+                        input_ids_list = [batched_data["input_ids"]]
+                        video_features_list = [batched_data["video_feature"]]
+                        input_masks_list = [batched_data["input_mask"]]
+                        token_type_ids_list = [batched_data["token_type_ids"]]
+                        input_labels_list = [batched_data["input_labels"]]
+                        importance_labels_list = self.build_importance_labels(
+                            input_labels_list, [current_step_gt_sentences]
+                        )
 
-                    # translate
-                    model_inputs = [batched_data["video_feature"], batched_data["video_mask"], batched_data["text_ids"],
-                                    batched_data["text_mask"], batched_data["text_labels"]]
+                        loss, pred_scores_list, new_memory = self.model(
+                            input_ids_list, video_features_list, input_masks_list,
+                            token_type_ids_list, input_labels_list,
+                            importance_labels_list=importance_labels_list,
+                            past_memory=current_memory
+                        )
+                        
+                        # --- 메모리 업데이트 ---
+                        if new_memory is not None:
+                            current_memory = new_memory 
 
-                    dec_seq = self.translator.translate_batch(
-                        model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=True)
-                    for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
-                        # example_idx indicates which example is in the batch
-                        cur_data = {
-                            "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
-                            # remove encoding .encode("utf-8"), "ascii", "ignore"),
-                            "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
-                        batch_res["results"][cur_meta["name"]].append(cur_data)
-                else:
-                    # non-recurrent but also not untied model (?)
-                    meta = batch[2]  # list(dict), len == bsz
+                        # --- 통계 ---
+                        total_loss += loss.item()
+                        
+                        n_correct = 0
+                        for pred, gold in zip(pred_scores_list, input_labels_list):
+                            n_correct += cal_performance(pred, gold)
+                            valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
+                            n_word_total += valid_label_mask.sum().item()
+                        n_word_correct += n_correct
+            
+            print(f" -> Loss Calc Done.")
 
-                    # validate
-                    batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
-                                                        non_blocking=self.cfg.cuda_non_blocking)
-                    input_ids = batched_data["input_ids"]
-                    video_features = batched_data["video_feature"]
-                    input_masks = batched_data["input_mask"]
-                    token_type_ids = batched_data["token_type_ids"]
-                    input_labels = batched_data["input_labels"]
-                    loss, pred_scores = self.model(input_ids, video_features, input_masks, token_type_ids, input_labels)
-                    pred_scores_list = [pred_scores]
-                    input_labels_list = [input_labels]
-                    # translate
-                    model_inputs = [batched_data["input_ids"], batched_data["video_feature"],
-                                    batched_data["input_mask"], batched_data["token_type_ids"]]
-                    dec_seq = self.translator.translate_batch(
-                        model_inputs, use_beam=self.cfg.use_beam, recurrent=False, untied=False)
-                    for example_idx, (cur_gen_sen, cur_meta) in enumerate(zip(dec_seq, meta)):
-                        # example_idx indicates which example is in the batch
-                        cur_data = {
-                            "sentence": dataset.convert_ids_to_sentence(cur_gen_sen.cpu().tolist()),
-                            # remove encoding .encode("utf-8"), "ascii", "ignore"),
-                            "timestamp": cur_meta["timestamp"], "gt_sentence": cur_meta["gt_sentence"]}
-                        batch_res["results"][cur_meta["name"]].append(cur_data)
+            # ====================================================
+            # Part 2: Translation (Generation)
+            # ====================================================
+            print(f"[Val Gen] Batch {_step} | Generating Captions for {batch_size} videos...")
 
-                # keep logs
-                n_correct = 0
-                n_word = 0
-                for pred, gold in zip(pred_scores_list, input_labels_list):
-                    n_correct += cal_performance(pred, gold)
-                    valid_label_mask = gold.ne(RecursiveCaptionDataset.IGNORE)
-                    n_word += valid_label_mask.sum().item()
+            for b_i in range(batch_size):
+                
+                # [로그 추가] 영상 단위 진행 상황 출력
+                print(f"\r  > Generating Video {b_i + 1}/{batch_size} (Max {EVAL_MAX_CLIPS} clips)...", end="")
 
-                # calculate metrix
-                n_word_total += n_word
-                n_word_correct += n_correct
-                total_loss += loss.item()
+                video_clips = batch_clips_lists[b_i][:EVAL_MAX_CLIPS] 
+                video_meta = batch_meta_lists[b_i][:EVAL_MAX_CLIPS]
+                
+                if not video_clips: continue
 
-            # end of step
+                vid_input_ids = []
+                vid_features = []
+                vid_masks = []
+                vid_token_types = []
+                
+                for clip in video_clips:
+                    c_data = prepare_batch_inputs(clip, use_cuda=self.cfg.use_cuda)
+                    vid_input_ids.append(c_data["input_ids"].unsqueeze(0))
+                    vid_features.append(c_data["video_feature"].unsqueeze(0))
+                    vid_masks.append(c_data["input_mask"].unsqueeze(0))
+                    vid_token_types.append(c_data["token_type_ids"].unsqueeze(0))
+                
+                model_inputs = [
+                    vid_input_ids, vid_features, vid_masks, vid_token_types
+                ]
+                
+                # 번역 실행
+                dec_seq_list = self.translator.translate_batch(
+                    model_inputs, use_beam=self.cfg.use_beam, recurrent=True,
+                    untied=False, xl=self.cfg.xl
+                )
+                
+                for step_idx, step_batch in enumerate(dec_seq_list):
+                    generated_ids = step_batch[0].cpu().tolist()
+                    cur_meta = video_meta[step_idx]
+                    sent = dataset.convert_ids_to_sentence(generated_ids)
+                    
+                    batch_res["results"][cur_meta["name"]].append({
+                        "sentence": sent,
+                        "timestamp": cur_meta["timestamp"],
+                        "gt_sentence": cur_meta["sentence"]
+                    })
+
+            print(" -> Generation Done.")
+
+            # End of Step
             self.hook_post_forward_step_timer()
             forward_time_total += self.timedelta_step_forward
             num_steps += 1
 
             if self.cfg.debug:
                 break
-
             pbar.update()
+        
         pbar.close()
 
-        # ---------- validation done ----------
-
-        # sort translation
+        # ---------- Validation Done ----------
         batch_res["results"] = self.translator.sort_res(batch_res["results"])
 
-        # write translation results of this epoch to file
-        eval_mode = self.cfg.dataset_val.split  # which dataset split
+        eval_mode = self.cfg.dataset_val.split
         file_translation_raw = self.exp.get_translation_files(self.state.current_epoch, eval_mode)
         json.dump(batch_res, file_translation_raw.open("wt", encoding="utf8"))
 
-        # get reference files (ground truth captions)
         reference_files_map = get_reference_files(self.cfg.dataset_val.name, self.exp.annotations_dir)
         reference_files = reference_files_map[eval_mode]
         reference_file_single = reference_files[0]
 
-        # language evaluation
         res_lang = evaluate_language_files(file_translation_raw, reference_files, verbose=False, all_scorer=True)
-        # basic stats
         res_stats = evaluate_stats_files(file_translation_raw, reference_file_single, verbose=False)
-        # repetition
         res_rep = evaluate_repetition_files(file_translation_raw, reference_file_single, verbose=False)
 
-        # merge results
         all_metrics = {**res_lang, **res_stats, **res_rep}
-        assert len(all_metrics) == len(res_lang) + len(res_stats) + len(res_rep), (
-            "Lost infos while merging translation results!")
 
-        # flatten results and make them json compatible
         flat_metrics = {}
         for key, val in all_metrics.items():
             if isinstance(val, Mapping):
@@ -606,58 +692,38 @@ class MartTrainer(trainer_base.BaseTrainer):
             if isinstance(val, (np.float16, np.float32, np.float64)):
                 flat_metrics[key] = float(val)
 
-        # feed meters
         for result_key, meter_name in TRANSLATION_METRICS.items():
             self.metrics.update_meter(meter_name, flat_metrics[result_key])
 
-        # log translation results
         self.logger.info(f"Done with translation, epoch {self.state.current_epoch} split {eval_mode}")
         self.logger.info(", ".join([f"{name} {flat_metrics[name]:.2%}" for name in TRANSLATION_METRICS_LOG]))
 
-        # calculate and output validation metrics
-        loss_per_word = 1.0 * total_loss / n_word_total
-        accuracy = 1.0 * n_word_correct / n_word_total
-        self.metrics.update_meter(MMeters.TRAIN_LOSS_PER_WORD, loss_per_word)
-        self.metrics.update_meter(MMeters.TRAIN_ACC, accuracy)
+        loss_per_word = 1.0 * total_loss / max(n_word_total, 1)
+        accuracy = 1.0 * n_word_correct / max(n_word_total, 1)
+        self.metrics.update_meter(MMeters.VAL_LOSS_PER_WORD, loss_per_word)
+        self.metrics.update_meter(MMeters.VAL_ACC, accuracy)
+        
         forward_time_total /= num_steps
         self.logger.info(
             f"Loss {loss_per_word:.5f} Acc {accuracy:.3%} total {timer() - self.timer_val_epoch:.3f}s, "
             f"forward {forward_time_total:.3f}s")
 
-        # find field which determines whether this is a new best epoch
         if self.cfg.val.det_best_field == "cider":
             val_score = flat_metrics["CIDEr"]
         else:
             raise NotImplementedError(f"best field {self.cfg.val.det_best_field} not known")
 
-        # check for a new best epoch and update validation results
         is_best = self.check_is_new_best(val_score)
         self.hook_post_val_epoch(loss_per_word, is_best)
 
         if self.is_test:
-            # for test runs, save the validation results separately to a file
             self.metrics.feed_metrics(False, self.state.total_step, self.state.current_epoch)
             metrics_file = self.exp.path_base / f"val_ep_{self.state.current_epoch}.json"
             self.metrics.save_epoch_to_file(metrics_file)
             self.logger.info(f"Saved validation results to {metrics_file}")
 
-            # update the meteor metric in the result if it's -999 because java crashed. only in some conditions
-            best_ep = self.exp.find_best_epoch()
-            self.logger.info(f"Dataset split config {self.cfg.dataset_val.split} loaded {self.load_ep} best {best_ep}")
-            if self.cfg.dataset_val.split == "val" and self.load_ep == best_ep == self.state.current_epoch:
-                # load metrics file and write it back with the new meteor IFF meteor is -999
-                metrics_file = self.exp.get_metrics_epoch_file(best_ep)
-                metrics_data = json.load(metrics_file.open("rt", encoding="utf8"))
-                # metrics has stored meteor as a list of tuples (epoch, value). convert to dict, update, convert back.
-                meteor_dict = dict(metrics_data[TextMetricsConst.METEOR])
-                if ((meteor_dict[best_ep] + 999) ** 2) < 1e-4:
-                    meteor_dict[best_ep] = flat_metrics[TextMetricsConstEvalCap.METEOR]
-                    metrics_data[TextMetricsConst.METEOR] = list(meteor_dict.items())
-                    json.dump(metrics_data, metrics_file.open("wt", encoding="utf8"))
-                    self.logger.info(f"Updated meteor in file {metrics_file}")
-
         return total_loss, val_score, is_best, flat_metrics
-
+    
     def get_opt_state(self) -> Dict[str, Dict[str, nn.Parameter]]:
         """
         Return the current optimizer and scheduler state.

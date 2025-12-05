@@ -24,6 +24,7 @@ import pickle
 from typing import List, Optional, Tuple
 
 import h5py
+import collections
 import nltk
 import numpy as np
 import torch
@@ -119,7 +120,7 @@ class RecursiveCaptionDataset(data.Dataset):
                 raise ValueError(f"Mode must be [train, val, test] for {self.dset_name}, got {mode}")
         elif self.dset_name == "youcook2":
             if mode == "train":  # 1333 videos
-                data_path = self.annotations_dir / self.dset_name / "processed_dataset.json"
+                data_path = self.annotations_dir / self.dset_name / "processed_dataset_train.json"
             elif mode == "val":  # 457 videos
                 data_path = self.annotations_dir / self.dset_name / "processed_dataset_val.json"
             else:
@@ -129,30 +130,50 @@ class RecursiveCaptionDataset(data.Dataset):
 
         # load and process captions and video data
         raw_data = json.load(data_path.open("rt", encoding="utf8"))
-        coll_data = []
-        for i, (k, line) in enumerate(tqdm(list(raw_data.items()))):
-            if dataset_max is not None and i >= dataset_max > 0:
-                break
+        
+        self.grouped_data = collections.defaultdict(list)
+
+        for k, line in tqdm(raw_data.items(), desc="Grouping by Match ID"):
+            # 파일명 파싱 (MatchID-ClipID 형식 가정)
+            if '-' in k:
+                match_id = k.rsplit('-', 1)[0]
+                try:
+                    part_id = int(k.rsplit('-', 1)[1])
+                except ValueError:
+                    part_id = 0
+            else:
+                match_id = k
+                part_id = 0
+            
+            # 필요한 필드 추가
             line["name"] = k
+            line["match_id"] = match_id
+            line["part_id"] = part_id
+            
+            # 원본 데이터 구조 보존 (timestamps, sentences 등)
             line["timestamps"] = line["timestamps"][:self.max_n_sen]
             line["sentences"] = line["sentences"][:self.max_n_sen]
-            coll_data.append(line)
+            
+            self.grouped_data[match_id].append(line)
 
-        if self.recurrent:  # recurrent
-            self.data = coll_data
-        else:  # non-recurrent single sentence
-            single_sentence_data = []
-            for d in coll_data:
-                num_sen = min(self.max_n_sen, len(d["sentences"]))
-                single_sentence_data.extend([
-                    {
-                        "duration": d["duration"],
-                        "name": d["name"],
-                        "timestamp": d["timestamps"][idx],
-                        "sentence": d["sentences"][idx],
-                        "idx": idx
-                    } for idx in range(num_sen)])
-            self.data = single_sentence_data
+        # 2. 각 Match 내부에서 시간 순서(part_id) 정렬 및 리스트화
+        self.data_list = []
+        sorted_match_ids = sorted(self.grouped_data.keys())
+        
+        processed_count = 0
+        for m_id in sorted_match_ids:
+            if dataset_max is not None and processed_count >= dataset_max > 0:
+                break
+            
+            clips = self.grouped_data[m_id]
+            # 시간 순서 정렬 (매우 중요)
+            clips.sort(key=lambda x: x['part_id'])
+            
+            self.data_list.append(clips)
+            processed_count += 1
+            
+        self.data = self.data_list # 이제 self.data의 요소 하나는 "한 경기 전체 클립들"임
+        print(f"Dataset Loaded: {len(self.data)} Matches (Videos)")
 
         # ---------- Load video data ----------
 
@@ -230,27 +251,33 @@ class RecursiveCaptionDataset(data.Dataset):
 
             # remove missing videos
             self.missing_video_names = []
-            for e in tqdm(self.data):
-                video_name = e["name"][2:] if self.dset_name == "activitynet" else e["name"]
-                if self.dset_name == "activitynet":
-                    cur_path1 = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
-                    cur_path2 = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
-                elif self.dset_name == "youcook2":
-                    cur_path1 = os.path.join(self.video_feature_dir, "{}_rgb.pkl".format(video_name))
-                    cur_path2 = os.path.join(self.video_feature_dir, "{}_flow.pkl".format(video_name))
-                for p in [cur_path1, cur_path2]:
-                    if not os.path.exists(p):
-                        self.missing_video_names.append(video_name)
-            print(f"Missing {len(self.missing_video_names)} features (clips/sentences) "
-                  f"from {len(set(self.missing_video_names))} videos")
-            print(f"Missing {set(self.missing_video_names)}")
-            print(self.video_feature_dir)
-            if self.dset_name == "activitynet":
-                self.data = [e for e in self.data if e["name"][2:] not in self.missing_video_names]
-            elif self.dset_name == "youcook2":
-                self.data = [e for e in self.data if e["name"] not in self.missing_video_names]
-            else:
-                raise ValueError(f"Dataset not understood {self.dset_name}")
+            for match_clips in self.data: # Match loop
+                for e in match_clips:     # Clip loop
+                    video_name = e["name"][2:] if self.dset_name == "activitynet" else e["name"]
+                    
+                    # 파일 존재 여부 확인 (경로 설정 유지)
+                    if self.dset_name == "activitynet":
+                        cur_path1 = os.path.join(self.video_feature_dir, "{}_resnet.npy".format(video_name))
+                        cur_path2 = os.path.join(self.video_feature_dir, "{}_bn.npy".format(video_name))
+                    elif self.dset_name == "youcook2":
+                        cur_path1 = os.path.join(self.video_feature_dir, "{}_rgb.pkl".format(video_name))
+                        cur_path2 = os.path.join(self.video_feature_dir, "{}_flow.pkl".format(video_name))
+                    
+                    for p in [cur_path1, cur_path2]:
+                        if not os.path.exists(p):
+                            self.missing_video_names.append(video_name)
+                            
+            print(f"Missing {len(self.missing_video_names)} features (clips/sentences)")
+            
+            # [수정] Missing Data Filter
+            if len(self.missing_video_names) > 0:
+                filtered_data = []
+                for match_clips in self.data:
+                    valid_clips = [e for e in match_clips if e["name"] not in self.missing_video_names]
+                    if len(valid_clips) > 0:
+                        filtered_data.append(valid_clips)
+                self.data = filtered_data
+
             assert len(self.data) > 0, "No data was found! Video features directory may not be setup correctly."
 
             self.frame_to_second = frame_to_second
@@ -261,27 +288,51 @@ class RecursiveCaptionDataset(data.Dataset):
         if self.preload:
             # load video features to memory
             self.preloaded_videos = {}
-            for meta in tqdm(self.data, desc=f"Preload {self.dset_name} {mode}"):
-                raw_name = meta["name"]
-                if self.data_type == DataTypesConstCaption.VIDEO_FEAT:
-                    # default video features from MART paper. returns np.array
-                    video_feature = self._load_mart_video_feature(raw_name)
-                    self.preloaded_videos[raw_name] = create_shared_array(video_feature)
-                else:
-                    # load and concatenate coot features for this video. returns Tuple[np.array, np.array, np.array]
-                    video_feature = self._load_coot_video_feature(raw_name)
-                    stack = []
-                    for array in video_feature:
-                        stack.append(create_shared_array(array))
-                    self.preloaded_videos[raw_name] = stack
+            for match_clips in tqdm(self.data, desc=f"Preload {self.dset_name} {mode}"):
+                for meta in match_clips:
+                    raw_name = meta["name"]
+                    if raw_name in self.preloaded_videos: continue # 중복 방지
+                    
+                    if self.data_type == DataTypesConstCaption.VIDEO_FEAT:
+                        video_feature = self._load_mart_video_feature(raw_name)
+                        self.preloaded_videos[raw_name] = create_shared_array(video_feature)
+                    else:
+                        video_feature = self._load_coot_video_feature(raw_name)
+                        stack = []
+                        for array in video_feature:
+                            stack.append(create_shared_array(array))
+                        self.preloaded_videos[raw_name] = stack
             self.preloading_done = True
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, index):
-        items, meta = self.convert_example_to_features(self.data[index])
-        return items, meta
+        # items, meta = self.convert_example_to_features(self.data[index])
+        # return items, meta
+        match_clips = self.data[index]
+        
+        # 이 경기에 속한 모든 클립을 개별적으로 처리하여 리스트로 만듦
+        processed_clips = []
+        match_meta = []
+        
+        for clip_data in match_clips:
+            # 기존 변환 함수 활용
+            items, meta = self.convert_example_to_features(clip_data)
+            
+            # Recurrent 모드에서는 items가 list of dicts 형태임 (한 클립 내 여러 문장)
+            # 여기서는 편의상 평탄화(Flatten)하여 1차원 리스트로 만듭니다.
+            if self.recurrent:
+                # items[0]은 list of features, items[1]은 list of meta
+                for feat, m in zip(items, meta):
+                    processed_clips.append(feat)
+                    match_meta.append(m)
+            else:
+                processed_clips.append(items)
+                match_meta.append(meta)
+        
+        # 반환: (List[Features], List[Meta])
+        return processed_clips, match_meta
 
     def _load_mart_video_feature(self, raw_name: str) -> np.array:
         """
@@ -397,6 +448,9 @@ class RecursiveCaptionDataset(data.Dataset):
                 cur_data, cur_meta = self.clip_sentence_to_feature(
                     example["name"], example["timestamps"][clip_idx], example["sentences"][clip_idx], video_feature,
                     clip_idx)
+                
+                cur_meta["match_id"] = example["match_id"]
+                
                 single_video_features.append(cur_data)
                 single_video_meta.append(cur_meta)
             return single_video_features, single_video_meta
@@ -404,6 +458,8 @@ class RecursiveCaptionDataset(data.Dataset):
             # single sentence
             cur_data, cur_meta = self.clip_sentence_to_feature_untied(
                 example["name"], example["timestamp"], example["sentence"], video_feature, example["idx"])
+            cur_meta["match_id"] = example["match_id"]
+
             return cur_data, cur_meta
         # single sentence not untied
         cur_data, cur_meta = self.clip_sentence_to_feature(
@@ -671,64 +727,89 @@ class RecursiveCaptionDataset(data.Dataset):
 
         Returns:
         """
-        if self.recurrent:
-            # recurrent collate function. original docstring:
-            # HOW to batch clip-sentence pair? 1) directly copy the last sentence, but do not count them in when
-            # back-prop OR put all -1 to their text token label, treat
+        batch_clips = [item[0] for item in batch] # List of (List of Clips)
+        batch_meta = [item[1] for item in batch]  # List of (List of Meta)
+        
+        # 여기서 억지로 패딩하지 않고 리스트 상태로 넘깁니다.
+        # 패딩은 train loop에서 step마다 할 것입니다.
+        
+        return batch_clips, None, batch_meta
+        
+        #     raw_batch_meta = [e[1] for e in batch]
+        #     batch_meta = []
+        #     for e in raw_batch_meta:
+        #         cur_meta = dict(
+        #             name=None,
+        #             timestamp=[],
+        #             gt_sentence=[]
+        #         )
+        #         for d in e:
+        #             cur_meta["name"] = d["name"]
+        #             cur_meta["timestamp"].append(d["timestamp"])
+        #             cur_meta["gt_sentence"].append(d["sentence"])
+        #             cur_meta["match_id"] = d.get("match_id", "unknown")
+        #         batch_meta.append(cur_meta)
 
-            # collect meta
-            raw_batch_meta = [e[1] for e in batch]
-            batch_meta = []
-            for e in raw_batch_meta:
-                cur_meta = dict(
-                    name=None,
-                    timestamp=[],
-                    gt_sentence=[]
-                )
-                for d in e:
-                    cur_meta["name"] = d["name"]
-                    cur_meta["timestamp"].append(d["timestamp"])
-                    cur_meta["gt_sentence"].append(d["sentence"])
-                batch_meta.append(cur_meta)
+        #     batch = [e[0] for e in batch]
+        #     # Step1: pad each example to max_n_sen
+        #     max_n_sen = max([len(e) for e in batch])
+        #     raw_step_sizes = []
 
-            batch = [e[0] for e in batch]
-            # Step1: pad each example to max_n_sen
-            max_n_sen = max([len(e) for e in batch])
-            raw_step_sizes = []
+        #     padded_batch = []
+        #     padding_clip_sen_data = copy.deepcopy(
+        #         batch[0][0])  # doesn"t matter which one is used
+        #     padding_clip_sen_data["input_labels"][:] = RecursiveCaptionDataset.IGNORE
+        #     for ele in batch:
+        #         cur_n_sen = len(ele)
+        #         if cur_n_sen < max_n_sen:
+        #             # noinspection PyAugmentAssignment
+        #             ele = ele + [padding_clip_sen_data] * (max_n_sen - cur_n_sen)
+        #         raw_step_sizes.append(cur_n_sen)
+        #         padded_batch.append(ele)
 
-            padded_batch = []
-            padding_clip_sen_data = copy.deepcopy(
-                batch[0][0])  # doesn"t matter which one is used
-            padding_clip_sen_data["input_labels"][:] = RecursiveCaptionDataset.IGNORE
-            for ele in batch:
-                cur_n_sen = len(ele)
-                if cur_n_sen < max_n_sen:
-                    # noinspection PyAugmentAssignment
-                    ele = ele + [padding_clip_sen_data] * (max_n_sen - cur_n_sen)
-                raw_step_sizes.append(cur_n_sen)
-                padded_batch.append(ele)
+        #     # Step2: batching each steps individually in the batches
+        #     collated_step_batch = []
+        #     for step_idx in range(max_n_sen):
+        #         collated_step = step_collate([e[step_idx] for e in padded_batch])
+        #         collated_step_batch.append(collated_step)
+        #     return collated_step_batch, raw_step_sizes, batch_meta
 
-            # Step2: batching each steps individually in the batches
-            collated_step_batch = []
-            for step_idx in range(max_n_sen):
-                collated_step = step_collate([e[step_idx] for e in padded_batch])
-                collated_step_batch.append(collated_step)
-            return collated_step_batch, raw_step_sizes, batch_meta
+        # # single sentences / untied
 
-        # single sentences / untied
-
-        # collect meta
-        batch_meta = [{
-            "name": e[1]["name"],
-            "timestamp": e[1]["timestamp"],
-            "gt_sentence": e[1]["sentence"]
-        } for e in batch]  # change key
-        padded_batch = step_collate([e[0] for e in batch])
-        return padded_batch, None, batch_meta
+        # # collect meta
+        # batch_meta = [{
+        #     "name": e[1]["name"],
+        #     "timestamp": e[1]["timestamp"],
+        #     "gt_sentence": e[1]["sentence"],
+        #     "match_id": e[1].get("match_id", "unknown")
+        # } for e in batch]  # change key
+        # padded_batch = step_collate([e[0] for e in batch])
+        # return padded_batch, None, batch_meta
 
 
 def prepare_batch_inputs(batch, use_cuda: bool, non_blocking=False):
     batch_inputs = dict()
+    
+    # [헬퍼 함수] Numpy면 Tensor로 변환
+    def _to_tensor(v):
+        if isinstance(v, np.ndarray):
+            return torch.from_numpy(v)
+        return v
+
+    # [수정] batch가 딕셔너리일 때 (단일 클립 처리 시)
+    if isinstance(batch, dict):
+        for k, v in batch.items():
+            v = _to_tensor(v) # 1. 텐서 변환
+            
+            # 2. GPU 이동
+            if use_cuda and isinstance(v, torch.Tensor):
+                batch_inputs[k] = v.cuda(non_blocking=non_blocking)
+            else:
+                batch_inputs[k] = v
+        return batch_inputs
+    
+    # 기존 로직 (이미 Collated 된 배치 처리)
+    # default_collate를 거쳐왔으면 이미 Tensor임
     bsz = len(batch["name"])
     for k, v in list(batch.items()):
         assert bsz == len(v), (bsz, k, v)

@@ -2,14 +2,14 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-  batch_size: 8
+  batch_size: 4
   num_epochs: 30
   loss_func: "crossentropy"
   clip_gradient: 1
 label_smoothing: 0.1
 # ---------- Validation ----------
 val:
-  batch_size: 50
+  batch_size: 1
   val_freq: 1
   val_start: 0
   det_best_field: "cider"
@@ -34,7 +34,7 @@ dataset_train:
   data_type: "auto"
   subset: "default"
   split: "train"
-  max_datapoints: -1
+  max_datapoints: 3
   shuffle: true
   pin_memory: true
   num_workers: 4
@@ -44,7 +44,7 @@ dataset_val:
   same_as: "dataset_train"
   shuffle: false
   split: "val"
-max_n_sen: 12 # 6 activitynet, 12 youcook2
+max_n_sen: 600 # 6 activitynet, 12 youcook2
 max_n_sen_add_val: 10
 max_t_len: 22
 max_v_len: 100 # 3 for mart with coot, 100 for rgb+flow video features
