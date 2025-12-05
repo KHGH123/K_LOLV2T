@@ -251,6 +251,8 @@ class MartTrainer(trainer_base.BaseTrainer):
         step_size = len(input_labels_list)
         N, L = input_labels_list[0].shape
 
+        device = input_labels_list[0].device
+
         importance_labels_list = []
 
         # 미래 이벤트 기반 importance 설정
@@ -259,12 +261,19 @@ class MartTrainer(trainer_base.BaseTrainer):
 
             # 미래 step들의 GT 문장을 검색
             for future_t in range(t + 1, min(t + 4, step_size)):  # 3-step 미래까지 검사 (hyperparam)
-                if self.contains_keyword(gt_sentences_list[future_t]):
+                future_sents = gt_sentences_list[future_t]  # list of N strings
+
+                # batch 중 하나라도 keyword를 포함하면 중요 step이라고 간주
+                has_keyword = any(
+                    (s is not None) and self.contains_keyword(s)
+                    for s in future_sents
+                )
+                if has_keyword:
                     importance_flag = 1
                     break
 
             # importance_flag = 0 or 1
-            importance_tensor = th.full((N, L), float(importance_flag))
+            importance_tensor = th.full((N, L), float(importance_flag), device=device, dtype=th.float32)
 
             importance_labels_list.append(importance_tensor)
 
@@ -316,9 +325,22 @@ class MartTrainer(trainer_base.BaseTrainer):
                         input_masks_list = [e["input_mask"] for e in batched_data]
                         token_type_ids_list = [e["token_type_ids"] for e in batched_data]
                         input_labels_list = [e["input_labels"] for e in batched_data]
-                        gt_sentences = [e["gt_sentences"] for e in batched_data]
+
+
                         # build importance labels
-                        importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences)
+                        max_step = len(batch[0])  # == len(batched_data)
+                        gt_sentences_per_step = []  # [step][batch]
+
+                        for step_idx in range(max_step):
+                            step_sentences = []
+                            for vid_meta in batch[2]:
+                                if step_idx < len(vid_meta["gt_sentence"]):
+                                    step_sentences.append(vid_meta["gt_sentence"][step_idx])
+                                else:
+                                    step_sentences.append(None)  # padding된 step
+                            gt_sentences_per_step.append(step_sentences)
+
+                        importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences_per_step)
 
                         if self.cfg.debug:
                             cur_data = batched_data[step]
@@ -328,7 +350,7 @@ class MartTrainer(trainer_base.BaseTrainer):
                             self.logger.info("token_type_ids \n{}".format(cur_data["token_type_ids"][step]))
 
                         loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
-                                                            token_type_ids_list, input_labels_list)
+                                                            token_type_ids_list, input_labels_list, importance_labels_list)
                     elif self.cfg.untied or self.cfg.mtrans:
                         # ---------- training step for untied models / vanilla transformer ----------
                         batched_data = prepare_batch_inputs(batch[0], use_cuda=self.cfg.use_cuda,
@@ -505,9 +527,21 @@ class MartTrainer(trainer_base.BaseTrainer):
                     token_type_ids_list = [e["token_type_ids"] for e in
                                            batched_data]
                     input_labels_list = [e["input_labels"] for e in batched_data]
-                    gt_sentences = [e["gt_sentences"] for e in batched_data]
+
                     # build importance labels
-                    importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences)                
+                    max_step = len(batch[0])  # == len(batched_data)
+                    gt_sentences_per_step = []  # [step][batch]
+
+                    for step_idx in range(max_step):
+                        step_sentences = []
+                        for vid_meta in batch[2]:
+                            if step_idx < len(vid_meta["gt_sentence"]):
+                                step_sentences.append(vid_meta["gt_sentence"][step_idx])
+                            else:
+                                step_sentences.append(None)  # padding된 step
+                        gt_sentences_per_step.append(step_sentences)
+
+                    importance_labels_list = self.build_importance_labels(input_labels_list, gt_sentences_per_step)
 
                     loss, pred_scores_list = self.model(input_ids_list, video_features_list, input_masks_list,
                                                         token_type_ids_list, input_labels_list, importance_labels_list)

@@ -1505,7 +1505,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             self.loss_func = nn.CrossEntropyLoss(ignore_index=-1)
         
         self.importance_head = nn.Linear(cfg.hidden_size, 1)
-        self.importance_loss_func = nn.BCEWithLogitsLoss()
+        self.importance_loss_fn = nn.BCEWithLogitsLoss()
 
         self.importance_loss_weight = 0.5
     
@@ -1586,7 +1586,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             fused_scores_list.append(logits)
 
             # 이 fused logits 기준으로 최종 loss 계산
-            total_loss += self.loss_func(
+            caption_loss_total += self.loss_func(
                 logits.view(-1, self.cfg.vocab_size),
                 input_labels_list[idx].view(-1)
             )
@@ -1595,7 +1595,6 @@ class BiDirectionalRecursiveTransformer(nn.Module):
             importance_logits = self.importance_head(fused_h).squeeze(-1)
             importance_scores_list.append(importance_logits)
 
-            # importance_labels_list가 주어졌을 때만 importance loss 계산
             if importance_labels_list is not None:
                 importance_labels = importance_labels_list[idx]  # (N, L)
 
@@ -1628,4 +1627,4 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         else:
             total_loss = caption_loss_total
 
-        return total_loss, fused_scores_list, importance_scores_list
+        return total_loss, fused_scores_list

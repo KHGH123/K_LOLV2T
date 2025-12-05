@@ -26,7 +26,7 @@ def test_save_load():
     config_file = setup_config_file_from_experiment_identifier(MNISTExperimentType, exp_group, exp_name,
                                                                config_dir=TrainerPathConst.DIR_CONFIG)
     config = load_yaml_config_file(config_file)
-    dataset_path = "data"
+    dataset_path = "../../../data"
     cfg = MLPMNISTExperimentConfig(config)
     cfg.dataset_train.num_workers = 0
     cfg.dataset_val.num_workers = 0

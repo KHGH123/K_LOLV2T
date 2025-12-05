@@ -2,14 +2,14 @@ description: ""
 config_type: "mart"
 # ---------- Training ----------
 train:
-  batch_size: 8
+  batch_size: 16
   num_epochs: 30
   loss_func: "crossentropy"
   clip_gradient: 1
 label_smoothing: 0.1
 # ---------- Validation ----------
 val:
-  batch_size: 50
+  batch_size: 30
   val_freq: 1
   val_start: 0
   det_best_field: "cider"
