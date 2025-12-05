@@ -250,31 +250,21 @@ class MartTrainer(trainer_base.BaseTrainer):
 
         step_size = len(input_labels_list)
         N, L = input_labels_list[0].shape
-
         device = input_labels_list[0].device
 
         importance_labels_list = []
 
         # 미래 이벤트 기반 importance 설정
         for t in range(step_size):
-            importance_flag = 0
+            gt_sents = gt_sentences_list[t]
+            importance_tensor = th.zeros((N, L), device=device, dtype=th.float32)
 
-            # 미래 step들의 GT 문장을 검색
-            for future_t in range(t + 1, min(t + 4, step_size)):  # 3-step 미래까지 검사 (hyperparam)
-                future_sents = gt_sentences_list[future_t]  # list of N strings
-
-                # batch 중 하나라도 keyword를 포함하면 중요 step이라고 간주
-                has_keyword = any(
-                    (s is not None) and self.contains_keyword(s)
-                    for s in future_sents
-                )
-                if has_keyword:
-                    importance_flag = 1
-                    break
-
-            # importance_flag = 0 or 1
-            importance_tensor = th.full((N, L), float(importance_flag), device=device, dtype=th.float32)
-
+            # 현재 setence에서 keyword가 있으면 1, 없으면 0
+            for b in range(N):
+                s = gt_sents[b]
+                if s is not None and self.contains_keyword(s):
+                    importance_tensor[b, :] == 1.0
+            
             importance_labels_list.append(importance_tensor)
 
         return importance_labels_list

@@ -1490,7 +1490,7 @@ class BiDirectionalRecursiveTransformer(nn.Module):
         self.bwd_model = RecursiveTransformer(cfg)
 
         # 파라미터 공유
-        # 동일한 encoder/decoder/embedding을 공유해서 파라미터 수를 늘리지 않을 수도 있음
+        # 동일한 encoder/decoder/embedding을 공유해서 파라미터 수 줄이기
         self.bwd_model.embeddings = self.fwd_model.embeddings
         self.bwd_model.encoder = self.fwd_model.encoder
         self.bwd_model.decoder = self.fwd_model.decoder
